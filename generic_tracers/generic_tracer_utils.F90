@@ -30,6 +30,7 @@ module g_tracer_utils
   use field_manager_mod, only: fm_dump_list, fm_loop_over_list
 
   use fms_mod,           only: stdout
+  use python_utilsF    , only: pyF_1_1d,pyF_2_1d
 
 #ifdef _USE_MOM6_DIAG
     use MOM_diag_mediator, only : register_diag_field_MOM=>register_diag_field
@@ -3093,6 +3094,88 @@ contains
     ! concentrations after the dual-entrainments, and possibly sinking or surface
     ! and bottom sources, are applied.  The sinking is implemented with an
     ! fully implicit upwind advection scheme.
+    !
+    ! This subroutine implements a modified version of the classic tridag algorithm
+    ! from the Numerical Recepies book by Press et,al (provided below for comparison).
+    ! The original tridag algorithm exactly solves the tridiagonal system of equations 
+    ! below for vector u given the vector r and coefficients a_k,b_k,c_k of: 
+    ! a_{k-1} u_{k-1} + b_k u_k + c_{k+1} u_{k+1} = r_k
+    !
+    ! In the present application 
+    !    r_k is the old (before update) tracer concentration field at level k 
+    !    u_k is the new (after  update) tracer concentration field at level k 
+    !    a_k = -ea(k)/h_old(k)
+    !    c_k = -eb(k)/h_old(k)
+    !    b_k = (h_old(k)+ea(k)+eb(k))/h_old(k)
+    !
+    ! The modifications of the original algorithm is to allow for surface and buttom fluxes
+    ! as well as possible sinking of the tracers.
+    !
+    ! In MOM6 models, all tracers are advected (both horizontally and vertically) by MOM6 
+    ! and also horizontally diffused by MOM6 if they are registered as MOM6 tracers 
+    ! (which is the case for generic tracers). 
+    ! So there remains a need to vertically diffuse tracers separately by tracer packages
+    ! (T&S vertdiff is again handled by MOM6).
+    !
+    ! So, why is the vertdiff needed at all?
+    !
+    ! The clue is in section A4 of Griffies et.al 2020:
+    ! https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2019MS001954
+    !  "the continuity equation has no subgrid scale operator even after coarse graining; 
+    ! that is, there is no diffusion of seawater mass, and hence, there are no mass 
+    ! sources/sinks in the ocean interior. This property means that a diffusive flux of 
+    ! salt crossing the boundary of a fluid element balances an oppositely directed 
+    ! diffusive flux of freshwater, thus leaving the fluid element with a constant mass 
+    ! but with a nonconstant salt  and freshwater content." 
+    !
+    ! Hence, in a vertical grid box of thickness h, if an amount of seawater mass is 
+    ! entered/diffused in, then the tracers must "diffuse" out of the box to keep the 
+    ! total watermass in the box constant constant.
+    ! In other words we must satisfy the following two constraints after such diffusive 
+    ! processes of water mass has occured (due to numerical diffusion of seawater mass?):
+    ! 
+    ! Final water  mass = Initial water  mass + water  mass entered
+    ! Final tracer mass = Initial tracer mass + tracer mass entered
+    !
+    ! hI = length equivalent of Initial water mass in layer k
+    ! hF = length equivalent of Final   water mass in layer k
+    ! ea = length equivalent of water mass entered from layer above 
+    ! eb = length equivalent of water mass entered from layer below
+    ! tI_k = Intial tracer concentration in layer k
+    ! tF_k = Final  tracer concentration in layer k
+    !
+    ! The two equations above become:
+    ! hF      = hI      + ea          + eb            (1)
+    ! hF*tF_k = hI*tI_k + ea*tF_{k-1} + eb*tF_{k+1}   (2) 
+    ! Or after replacing hF from (1) into (2) we get:
+    ! 
+    ! -ea*tF_{k-1} + (hI+ea+eb)*tF_k -eb*tF_{k+1} = hI*tI_k
+    !
+    ! This is a tridiagonal system for unknown vector tF:
+    !  a_k*tF_{k-1} + b_k*tF_k c_k*tF_{k+1} = d_k    k=1,...,N
+    !    a_k = -ea(k)/h_old(k)
+    !    c_k = -eb(k)/h_old(k)
+    !    b_k = (h_old(k)+ea(k)+eb(k))/h_old(k)
+    !    d_k = tI_k
+    ! 
+    ! This algorithm can be extended for the cases that the tracers have a surface or buttom
+    ! flux. In such cases the length-equivalent of tracer mass entered  to the top or buttom
+    ! layer can simply be added (with the sign of flux considered) to the right hand side
+    ! of equation (3) for k=1 and k=N equations (i.e., hI*tI_1 and hI*tI_N) .
+    !
+    !
+    ! So vertdiff is to fill the void of subgrid scale processes to correct the 
+    ! vertical advection equations for diffusive processes. 
+    ! We could try to include the sinking of tracers (due to gravity or active processes?)
+    ! in this "diffusive" correction. 
+    ! Suppose a tracer sinks a distance s(k) (in the layer above layer k) in each timestep.
+    ! Then the tracer mass entered into layer k from the layer above, ea(k), 
+    ! is enhanced by the tracer mass that has sinked into layer k from layer above in that
+    ! timestep, s(k). So the net effect is that ea(k) being replaced by ea(k)+s(k) in 
+    ! tracer equation (2) for k=2,...,N :
+    ! -(ea+s)*tF_{k-1} + (hI+ea+eb)*tF_k -eb*tF_{k+1} = hI*tI_k
+    ! This translates into a --> a+s in the original Press et.al. algorithm or
+    ! 
 
     real :: sink_dist(1:g_tracer_com%nk+1)    ! The distance the tracer sinks in a time step, in H.
     real :: sfc_src      ! The time-integrated surface source of the tracer, in
@@ -3110,8 +3193,16 @@ contains
     ! crossing within a single timestep, in H.
     real :: b_denom_1    ! The first term in the denominator of b1, in H.
     real :: H_to_kg_m2   ! 1 / kg_m2_to_H.
+    real :: h_neglect !< A thickness that is so small it is usually lost
+                      !! in roundoff and can be neglected [H ~> m or kg m-2].
     integer :: i, j, k, nz
     logical :: do_diagnostic
+    real :: temparray1d1(1:g_tracer_com%nk),temparray1d2(1:g_tracer_com%nk)
+    real :: temparray1d3(1:g_tracer_com%nk),temparray1d4(1:g_tracer_com%nk)
+
+    h_neglect = 1.0e-6 ! GV%H_subroundoff
+
+    temparray1d1(:)= g_tracer%field(5,5,1:g_tracer_com%nk,tau)*h_old(5,5,:)
 
     !
     !   Save the current state for calculation of the implicit vertical diffusion term
@@ -3138,7 +3229,6 @@ contains
 
     d1 = 0.0
     H_to_kg_m2 = 1.0 / kg_m2_to_H
-
     sink_dist = (dt*g_tracer%sink_rate) * m_to_H
 
     do j=g_tracer_com%jsc,g_tracer_com%jec ; do i=g_tracer_com%isc,g_tracer_com%iec 
@@ -3185,29 +3275,31 @@ contains
              if(g_tracer%field(i,j,k-1,tau) <= 0.0) sink(k) = 0.0
           enddo
 
+          !temporary fix to study the effect of h_minus_dsink
+          do k=1,nz
+             h_minus_dsink(k) = h_old(i,j,k)
+          enddo
           ! Now solve the tridiagonal equation for the tracer concentrations.
 
-          b_denom_1 = h_minus_dsink(1) + ea(i,j,1)
+          b_denom_1 = h_minus_dsink(1) + ea(i,j,1) + h_neglect
           b1 = 1.0 / (b_denom_1 + eb(i,j,1))
           d1 = b_denom_1 * b1
 
           if (_ALLOCATED(g_tracer%stf)) sfc_src = (g_tracer%stf(i,j)*dt)*kg_m2_to_H
-
           g_tracer%field(i,j,1,tau) = b1*(h_old(i,j,1)*g_tracer%field(i,j,1,tau) + sfc_src)
 
           do k=2,nz-1 
              c1(k) = eb(i,j,k-1) * b1
-             b_denom_1 = h_minus_dsink(k) + d1 * (ea(i,j,k) + sink(k))
+             b_denom_1 = h_minus_dsink(k) + d1 * (ea(i,j,k) + sink(k)) + h_neglect
              b1 = 1.0 / (b_denom_1 + eb(i,j,k))
              d1 = b_denom_1 * b1
-
              g_tracer%field(i,j,k,tau) = b1 * (h_old(i,j,k) * g_tracer%field(i,j,k,tau) + &
                   (ea(i,j,k) + sink(k)) * g_tracer%field(i,j,k-1,tau))
           enddo
 
 
           c1(nz) = eb(i,j,nz-1) * b1
-          b_denom_1 = h_minus_dsink(nz) + d1 * (ea(i,j,nz) + sink(nz))
+          b_denom_1 = h_minus_dsink(nz) + d1 * (ea(i,j,nz) + sink(nz)) + h_neglect
           b1 = 1.0 / (b_denom_1 + eb(i,j,nz))
 
           if (_ALLOCATED(g_tracer%btf)) btm_src = (-g_tracer%btf(i,j)*dt)*kg_m2_to_H
@@ -3223,9 +3315,7 @@ contains
           do k=nz-1,1,-1
              g_tracer%field(i,j,k,tau) = g_tracer%field(i,j,k,tau) + c1(k+1)*g_tracer%field(i,j,k+1,tau)
           enddo
-
         endif !(g_tracer_com%grid_tmask(i,j,1) > 0.5)
-
     enddo; enddo ! i,j
 
     !
@@ -3244,7 +3334,71 @@ contains
       enddo
     endif
 
+    temparray1d2(:)= g_tracer%field(5,5,1:g_tracer_com%nk,tau)*h_old(5,5,:)
+
+    if(trim(g_tracer%name) .eq. 'gtr1' .or. trim(g_tracer%name) .eq. 'gtr2') then
+       call mpp_error(NOTE, "g_tracer_vertdiff_G: vertical profile for "//trim(g_tracer%name))
+       call pyF_2_1d('test.py', 'py_plot1Darrays', 'g_tracer%field after vertdiff '//trim(g_tracer%name), temparray1d1,temparray1d2)
+    endif
+
   end subroutine g_tracer_vertdiff_G
+
+  subroutine tridag_original_Press_et_al(a,b,c,r,u,n)
+    integer, intent(in) :: n
+    real,    intent(in) :: a(n),b(n),c(n),r(n)
+    real,    intent(inout) :: u(n)
+    real    :: bet,gam(n)
+    integer :: k
+    bet=b(1)
+    u(1)=r(1)/bet
+    do k=2,n
+       gam(k)=c(k-1)/bet
+       bet=b(k)-a(k)*gam(k)
+       u(k)=(r(k)-a(k)*u(k-1))/bet
+    enddo
+    do k=n-1,1,-1
+       u(k)=u(k)-gam(k+1)*u(k+1)
+    enddo
+  end subroutine tridag_original_Press_et_al
+
+  subroutine tridag_implemented(ea,h,eb,r,u,nz)
+    integer, intent(in) :: nz
+    real,    intent(in) :: ea(nz),h(nz),eb(nz),r(nz)
+    real,    intent(inout) :: u(nz)
+    real    :: bet,gam(nz),b1,b_denom_1,d1
+    integer :: k
+    b_denom_1 = h(1) + ea(1)
+    b1 = 1.0 / (b_denom_1 + eb(1))  
+    !u(1) = b1*h(1)*r(1)
+    !or instead define bet
+    bet=1.0/(b1*h(1)) !=(h(1)+ea(1)+eb(1))/h(1)
+                      !this must be b(1) to match tridag
+                      !so it seems b=(ea+eb+h)/h
+    u(1) = r(1)/bet
+    d1 = b_denom_1 * b1  != (h(1) + ea(1))/(h(1)+ea(1)+eb(1))
+    do k=2,nz
+       !c1(k) = eb(k-1) * b1 =-gam
+       gam(k) = -eb(k-1) * b1  !=-eb(k-1)*(1/(bet(k-1)*h(k-1)))
+                               !=-eb(k-1)/h(k-1) / bet
+                               !this must be c(k-1)/bet to match tridag
+                               !so it seems c(k) = -eb(k)/h(k)
+       b_denom_1 = h(k) + d1 * ea(k)
+       b1 = 1.0 / (b_denom_1 + eb(k))
+       d1 = b_denom_1 * b1     !=(h(k) + d1(k-1) * ea(k))/(h(k) + d1(k-1) * ea(k)+eb(k))
+       !u(k) = b1 * (h(k) * r(k) + ea(k) * u(k-1))
+       bet=1.0/(b1*h(k)) != (h(k) + d1(k-1) * ea(k)+ eb(k))/h(k)
+                         != 1 + eb(k)/h(k) + d1(k-1) *ea(k)/h(k)
+                         != 1 + eb(k)/h(k) + ea(k)/h(k) + (d1(k-1)-1) *ea(k)/h(k)
+                         !this must be b(k)-a(k)*gam(k)  to match tridag
+                         !so  b(k)=(h(k)+eb(k)+ea(k))/h(k)=1-a-c or a+b+c=1
+                         !and d1(k-1)-1 = gam(k) ! Is this true? Yes.
+                         !d1(k-1)-1 = b_denom_1/(b_denom_1 + eb(k)) - 1 = -eb(k-1)*b1
+       u(k) = (r(k) + (ea(k)/h(k)) * u(k-1))/bet ! to match tridag we need a(k)=-ea(k)/h(k)
+    enddo
+    do k=nz-1,1,-1
+       u(k) = u(k) - gam(k+1)*u(k+1)
+    enddo
+  end subroutine tridag_implemented
 
   ! <SUBROUTINE NAME="g_tracer_vertdiff_M">
   !  <OVERVIEW>

@@ -136,9 +136,7 @@ module generic_CFC
       stf_gas_cfc11, &
       stf_gas_cfc12
 
-    real, dimension(:,:,:,:), pointer :: &
-      p_cfc11, &
-      p_cfc12
+    real, dimension(:,:,:,:), pointer ::  p_cfc11, p_cfc12, p_gtr1, p_gtr2
 
   end type generic_CFC_type
 
@@ -176,7 +174,10 @@ contains
 
   subroutine generic_CFC_init(tracer_list)
     type(g_tracer_type), pointer :: tracer_list
-
+    integer :: isc,iec, jsc,jec,isd,ied,jsd,jed,nk,ntau 
+    integer :: i, j, k
+    real, dimension(:,:,:), pointer :: ptr3d,ptr3d_2
+    real, dimension(:,:,:,:), pointer :: ptr4d
     character(len=fm_string_len), parameter :: sub_name = 'generic_CFC_init'
 
     !Specify and initialize all parameters used by this package
@@ -184,6 +185,17 @@ contains
 
     !Allocate and initiate all the private work arrays used by this module.
     call user_allocate_arrays
+
+    call g_tracer_get_common(isc,iec,jsc,jec,isd,ied,jsd,jed,nk,ntau)
+    call g_tracer_get_pointer(tracer_list,'gtr1','field', ptr3d)
+    do k=1,10
+      ptr3d(:,:,k) = 1.0 !(-k+10)
+    enddo
+    call g_tracer_get_pointer(tracer_list,'gtr2','field', ptr3d)
+!    ptr3d(:,:,:) = 1.0
+    do k=1,10
+      ptr3d(:,:,k) = 1.0 !(-k+10) 
+    enddo
 
   end subroutine generic_CFC_init
 
@@ -431,6 +443,26 @@ contains
          standard_name = "mole_concentration_of_cfc11_in_sea_water", &
          diag_field_units = 'mol m-3',                               &
          diag_field_scaling_factor = 1035.0)   ! rho = 1035.0 kg/m3, converts mol/kg to mol/m3
+
+    !fake passive tracers for testing
+    call g_tracer_add(tracer_list,package_name,&		
+         name       = 'gtr1',                  &		
+         longname   = 'fake passive tracer1',  &		
+         units      = 'NA',                    &		
+         prog       = .true.,                  &		
+!         const_init_value = 1.0 ,              &
+         requires_src_info  = .false.,         &		
+         sink_rate  = 0.01,     &
+         btm_reservoir = .true.,     &
+         flux_gas       = .false.)
+
+    call g_tracer_add(tracer_list,package_name,&		
+         name       = 'gtr2',                  &		
+         longname   = 'fake passive tracer2',  &		
+         units      = 'NA',                    &		
+         prog       = .true.,                  &
+         requires_src_info  = .false.,         &		
+         flux_gas       = .false.)
 
   end subroutine user_add_tracers
 
