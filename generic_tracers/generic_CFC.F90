@@ -189,7 +189,7 @@ contains
     call g_tracer_get_common(isc,iec,jsc,jec,isd,ied,jsd,jed,nk,ntau)
     call g_tracer_get_pointer(tracer_list,'gtr1','field', ptr3d)
     do k=1,10
-      ptr3d(:,:,k) = 1.0 !(-k+10)
+      ptr3d(:,:,k) = exp(-0.1*(k-5)**2)
     enddo
     call g_tracer_get_pointer(tracer_list,'gtr2','field', ptr3d)
 !    ptr3d(:,:,:) = 1.0
@@ -445,23 +445,23 @@ contains
          diag_field_scaling_factor = 1035.0)   ! rho = 1035.0 kg/m3, converts mol/kg to mol/m3
 
     !fake passive tracers for testing
-    call g_tracer_add(tracer_list,package_name,&		
-         name       = 'gtr1',                  &		
-         longname   = 'fake passive tracer1',  &		
-         units      = 'NA',                    &		
-         prog       = .true.,                  &		
+    call g_tracer_add(tracer_list,package_name,&
+         name       = 'gtr1',                  &
+         longname   = 'fake passive tracer1',  &
+         units      = 'NA',                    &
+         prog       = .true.,                  &
 !         const_init_value = 1.0 ,              &
-         requires_src_info  = .false.,         &		
-         sink_rate  = 0.01,     &
+         requires_src_info  = .false.,         &
+         sink_rate  = 0.001,     &
          btm_reservoir = .true.,     &
          flux_gas       = .false.)
 
-    call g_tracer_add(tracer_list,package_name,&		
-         name       = 'gtr2',                  &		
-         longname   = 'fake passive tracer2',  &		
-         units      = 'NA',                    &		
+    call g_tracer_add(tracer_list,package_name,&
+         name       = 'gtr2',                  &
+         longname   = 'fake passive tracer2',  &
+         units      = 'NA',                    &
          prog       = .true.,                  &
-         requires_src_info  = .false.,         &		
+         requires_src_info  = .false.,         &
          flux_gas       = .false.)
 
   end subroutine user_add_tracers

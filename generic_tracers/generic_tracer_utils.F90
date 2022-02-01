@@ -3172,9 +3172,9 @@ contains
     ! Then the tracer mass entered into layer k from the layer above, ea(k), 
     ! is enhanced by the tracer mass that has sinked into layer k from layer above in that
     ! timestep, s(k). So the net effect is that ea(k) being replaced by ea(k)+s(k) in 
-    ! tracer equation (2) for k=2,...,N :
-    ! -(ea+s)*tF_{k-1} + (hI+ea+eb)*tF_k -eb*tF_{k+1} = hI*tI_k
-    ! This translates into a --> a+s in the original Press et.al. algorithm or
+    ! tracer equation (2) for k=2,...,N. Similarly eb(k) should be replaced by eb(k)-s(k+1) :
+    ! -(ea+s)*tF_{k-1} + (hI+ea+eb)*tF_k -(eb-s(k+1))*tF_{k+1} = hI*tI_k
+    ! This translates into a(k) --> a(k)+s(k) and c(k) --> c(k)-s(k+1) in the Press et.al. algorithm 
     ! 
 
     real :: sink_dist(1:g_tracer_com%nk+1)    ! The distance the tracer sinks in a time step, in H.
@@ -3282,23 +3282,23 @@ contains
           ! Now solve the tridiagonal equation for the tracer concentrations.
 
           b_denom_1 = h_minus_dsink(1) + ea(i,j,1) + h_neglect
-          b1 = 1.0 / (b_denom_1 + eb(i,j,1))
+          b1 = 1.0 / (b_denom_1 + eb(i,j,1)-sink(2))
           d1 = b_denom_1 * b1
 
           if (_ALLOCATED(g_tracer%stf)) sfc_src = (g_tracer%stf(i,j)*dt)*kg_m2_to_H
           g_tracer%field(i,j,1,tau) = b1*(h_old(i,j,1)*g_tracer%field(i,j,1,tau) + sfc_src)
 
           do k=2,nz-1 
-             c1(k) = eb(i,j,k-1) * b1
+             c1(k) = (eb(i,j,k-1)-sink(k)) * b1
              b_denom_1 = h_minus_dsink(k) + d1 * (ea(i,j,k) + sink(k)) + h_neglect
-             b1 = 1.0 / (b_denom_1 + eb(i,j,k))
+             b1 = 1.0 / (b_denom_1 + eb(i,j,k)-sink(k+1))
              d1 = b_denom_1 * b1
              g_tracer%field(i,j,k,tau) = b1 * (h_old(i,j,k) * g_tracer%field(i,j,k,tau) + &
                   (ea(i,j,k) + sink(k)) * g_tracer%field(i,j,k-1,tau))
           enddo
 
 
-          c1(nz) = eb(i,j,nz-1) * b1
+          c1(nz) = (eb(i,j,nz-1)-sink(nz)) * b1
           b_denom_1 = h_minus_dsink(nz) + d1 * (ea(i,j,nz) + sink(nz)) + h_neglect
           b1 = 1.0 / (b_denom_1 + eb(i,j,nz))
 
