@@ -3093,158 +3093,170 @@ contains
     ! concentrations after the dual-entrainments, and possibly sinking or surface
     ! and bottom sources, are applied.  The sinking is implemented with an
     ! fully implicit upwind advection scheme.
+    !
+    ! This subroutine implements a modified version of the classic tridag algorithm
+    ! from the Numerical Recepies book by Press et,al (provided below for comparison).
+    ! The original tridag algorithm exactly solves the tridiagonal system of equations 
+    ! below for vector u given the vector r and coefficients a_k,b_k,c_k of: 
+    ! a_{k-1} u_{k-1} + b_k u_k + c_{k+1} u_{k+1} = r_k
+    !
+    ! In the present application 
+    !    r_k is the old (before update) tracer concentration field at level k 
+    !    u_k is the new (after  update) tracer concentration field at level k 
+    !    a_k = -ea(k)/h_old(k)
+    !    c_k = -eb(k)/h_old(k)
+    !    b_k = (h_old(k)+ea(k)+eb(k))/h_old(k)
+    !
+    ! The modifications of the original algorithm is to allow for surface and buttom fluxes
+    ! as well as possible sinking of the tracers.
+    !
+    ! In MOM6 models, all tracers are advected (both horizontally and vertically) by MOM6 
+    ! and also horizontally diffused by MOM6 if they are registered as MOM6 tracers 
+    ! (which is the case for generic tracers). 
+    ! So there remains a need to vertically diffuse tracers separately by tracer packages
+    ! (T&S vertdiff is again handled by MOM6).
+    !
+    ! So, why is the vertdiff needed at all?
+    !
+    ! The clue is in section A4 of Griffies et.al 2020:
+    ! https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2019MS001954
+    !  "the continuity equation has no subgrid scale operator even after coarse graining; 
+    ! that is, there is no diffusion of seawater mass, and hence, there are no mass 
+    ! sources/sinks in the ocean interior. This property means that a diffusive flux of 
+    ! salt crossing the boundary of a fluid element balances an oppositely directed 
+    ! diffusive flux of freshwater, thus leaving the fluid element with a constant mass 
+    ! but with a nonconstant salt  and freshwater content." 
+    !
+    ! Hence, in a vertical grid box of thickness h, if an amount of seawater mass is 
+    ! entered/diffused in, then the tracers must "diffuse" out of the box to keep the 
+    ! total watermass in the box constant constant.
+    ! In other words we must satisfy the following two constraints after such diffusive 
+    ! processes of water mass has occured (due to numerical diffusion of seawater mass?):
+    ! 
+    ! Final water  mass = Initial water  mass + water  mass entered
+    ! Final tracer mass = Initial tracer mass + tracer mass entered
+    !
+    ! hI = length equivalent of Initial water mass in layer k
+    ! hF = length equivalent of Final   water mass in layer k
+    ! ea = length equivalent of water mass entered from layer above 
+    ! eb = length equivalent of water mass entered from layer below
+    ! tI_k = Intial tracer concentration in layer k
+    ! tF_k = Final  tracer concentration in layer k
+    !
+    ! The two equations above become:
+    ! hF      = hI      + ea          + eb            (1)
+    ! hF*tF_k = hI*tI_k + ea*tF_{k-1} + eb*tF_{k+1}   (2) 
+    ! Or after replacing hF from (1) into (2) we get:
+    ! 
+    ! -ea*tF_{k-1} + (hI+ea+eb)*tF_k -eb*tF_{k+1} = hI*tI_k
+    !
+    ! This is a tridiagonal system for unknown vector tF:
+    !  a_k*tF_{k-1} + b_k*tF_k c_k*tF_{k+1} = d_k    k=1,...,N
+    !    a_k = -ea(k)/h_old(k)
+    !    c_k = -eb(k)/h_old(k)
+    !    b_k = (h_old(k)+ea(k)+eb(k))/h_old(k)
+    !    d_k = tI_k
+    ! 
+    ! This algorithm can be extended for the cases that the tracers have a surface or buttom
+    ! flux. In such cases the length-equivalent of tracer mass entered  to the top or buttom
+    ! layer can simply be added (with the sign of flux considered) to the right hand side
+    ! of equation (3) for k=1 and k=N equations (i.e., hI*tI_1 and hI*tI_N) .
+    !
+    !
+    ! So vertdiff is to fill the void of subgrid scale processes to correct the 
+    ! vertical advection equations for diffusive processes. 
+    ! We could try to include the sinking of tracers (due to gravity or active processes?)
+    ! in this "diffusive" correction. 
+    ! Suppose a tracer sinks a distance s(k) (in the layer above layer k) in each timestep.
+    ! Then the tracer mass entered into layer k from the layer above, ea(k), 
+    ! is enhanced by the tracer mass that has sinked into layer k from layer above in that
+    ! timestep, s(k). So the net effect is that ea(k) being replaced by ea(k)+s(k) in 
+    ! tracer equation (2) for k=2,...,N. Similarly eb(k) should be replaced by eb(k)-s(k+1) :
+    ! -(ea+s)*tF_{k-1} + (hI+ea+eb)*tF_k -(eb-s(k+1))*tF_{k+1} = hI*tI_k
+    ! This translates into a(k) --> a(k)+s(k) and c(k) --> c(k)-s(k+1) in the Press et.al. algorithm 
+    ! 
 
     real :: sink_dist(1:g_tracer_com%nk+1)    ! The distance the tracer sinks in a time step, in H.
     real :: sfc_src      ! The time-integrated surface source of the tracer, in
     ! units of H times a concentration.
     real :: btm_src      ! The time-integrated bottom source of the tracer, in
     ! units of H times a concentration.
-    real :: b1           ! b1 is used by the tridiagonal solver, in H-1.
-    real :: d1           ! d1=1-c1 is used by the tridiagonal solver, nondimensional.
-    real :: c1(1:g_tracer_com%nk)     ! c1 is used by the tridiagonal solver, ND.
-    real :: h_minus_dsink(1:g_tracer_com%nk)  ! The layer thickness minus the
-    ! difference in sinking rates across the layer, in H.
-    ! By construction, 0 <= h_minus_dsink < h_old.
     real :: sink(1:g_tracer_com%nk+1) ! The tracer's sinking distances at the
-    ! interfaces, limited to prevent characteristics from
-    ! crossing within a single timestep, in H.
-    real :: b_denom_1    ! The first term in the denominator of b1, in H.
+    ! interfaces
     real :: H_to_kg_m2   ! 1 / kg_m2_to_H.
+    real :: h_neglect !< A thickness that is so small it is usually lost
+                      !! in roundoff and can be neglected [H ~> m or kg m-2].
     integer :: i, j, k, nz
-    logical :: do_diagnostic
+    real :: a(1:g_tracer_com%nk),b(1:g_tracer_com%nk),c(1:g_tracer_com%nk)
+    real :: f_old(1:g_tracer_com%nk)
 
-    !
-    !   Save the current state for calculation of the implicit vertical diffusion term
-    !
+    h_neglect = 1.0e-6 ! GV%H_subroundoff
 
-    if (g_tracer%diag_id_vdiffuse_impl .gt. 0) then
-      if (present(mom)) then
-        do_diagnostic = .not. mom
-      else
-        do_diagnostic = .false.
-      endif
-    else
-      do_diagnostic = .false.
-    endif
-    if (do_diagnostic) then
-      do j = g_tracer_com%jsc, g_tracer_com%jec
-         do i = g_tracer_com%isc, g_tracer_com%iec
-            do k = 1, g_tracer_com%nk
-               g_tracer%vdiffuse_impl(i,j,k) = g_tracer%field(i,j,k,tau) 
-            enddo
-         enddo
-      enddo
-    endif
 
-    d1 = 0.0
     H_to_kg_m2 = 1.0 / kg_m2_to_H
-
     sink_dist = (dt*g_tracer%sink_rate) * m_to_H
 
     do j=g_tracer_com%jsc,g_tracer_com%jec ; do i=g_tracer_com%isc,g_tracer_com%iec 
-
        if (g_tracer_com%grid_tmask(i,j,1) > 0.5) then
-
           nz=g_tracer_com%grid_kmt(i,j)
-
+          !handle the case where tracer has a specific sinking rate g_tracer%vmove
           if (g_tracer%move_vertical) then
-	    do k=2,nz; sink_dist(k) = (dt*g_tracer%vmove(i,j,k)) * m_to_H; enddo
-	  endif
-          sfc_src = 0.0 ; btm_src = 0.0 
-
-          ! Find the sinking rates at all interfaces, limiting them if necesary
-          ! so that the characteristics do not cross within a timestep.
-          !   If a non-constant sinking rate were used, that would be incorprated
-          ! here.
-          if (_ALLOCATED(g_tracer%btm_reservoir)) then
-             do k=2,nz 
-                sink(k) = sink_dist(k) ; h_minus_dsink(k) = h_old(i,j,k)
-             enddo
-             sink(nz+1) = sink_dist(nz+1) 
-          else
-             sink(nz+1) = 0.0 
-             ! Find the limited sinking distance at the interfaces.
-             do k=nz,2,-1
-                if (sink(k+1) >= sink_dist(k)) then
-                   sink(k) = sink_dist(k)
-                   h_minus_dsink(k) = h_old(i,j,k) + (sink(k+1) - sink(k))
-                elseif (sink(k+1) + h_old(i,j,k) < sink_dist(k)) then
-                   sink(k) = sink(k+1) + h_old(i,j,k)
-                   h_minus_dsink(k) = 0.0
-                else
-                   sink(k) = sink_dist(k)
-                   h_minus_dsink(k) = (h_old(i,j,k) + sink(k+1)) - sink(k)
-                endif
-             enddo
+            do k=2,nz; sink_dist(k) = (dt*g_tracer%vmove(i,j,k)) * m_to_H; enddo
           endif
-
-          sink(1) = 0.0 ; h_minus_dsink(1) = (h_old(i,j,1) + sink(2))
+          !sink(k) distance equivalent of the tracer mass that has sunk into layer k
+          do k=2,nz; sink(k) = sink_dist(k); enddo
+          sink(nz+1) = sink_dist(nz+1) !needed if there is a reservoir
+          sink(1) = 0.0 !nothing sinks into layer 1
 
           !Avoid sinking tracers with negative concentrations
           do k=2,nz+1
              if(g_tracer%field(i,j,k-1,tau) <= 0.0) sink(k) = 0.0
           enddo
-
-          ! Now solve the tridiagonal equation for the tracer concentrations.
-
-          b_denom_1 = h_minus_dsink(1) + ea(i,j,1)
-          b1 = 1.0 / (b_denom_1 + eb(i,j,1))
-          d1 = b_denom_1 * b1
-
+          !Handle surface and bottom fluxes
+          sfc_src = 0.0 ; btm_src = 0.0 
           if (_ALLOCATED(g_tracer%stf)) sfc_src = (g_tracer%stf(i,j)*dt)*kg_m2_to_H
-
-          g_tracer%field(i,j,1,tau) = b1*(h_old(i,j,1)*g_tracer%field(i,j,1,tau) + sfc_src)
-
-          do k=2,nz-1 
-             c1(k) = eb(i,j,k-1) * b1
-             b_denom_1 = h_minus_dsink(k) + d1 * (ea(i,j,k) + sink(k))
-             b1 = 1.0 / (b_denom_1 + eb(i,j,k))
-             d1 = b_denom_1 * b1
-
-             g_tracer%field(i,j,k,tau) = b1 * (h_old(i,j,k) * g_tracer%field(i,j,k,tau) + &
-                  (ea(i,j,k) + sink(k)) * g_tracer%field(i,j,k-1,tau))
-          enddo
-
-
-          c1(nz) = eb(i,j,nz-1) * b1
-          b_denom_1 = h_minus_dsink(nz) + d1 * (ea(i,j,nz) + sink(nz))
-          b1 = 1.0 / (b_denom_1 + eb(i,j,nz))
+          g_tracer%field(i,j,1,tau) = g_tracer%field(i,j,1,tau) + sfc_src/h_old(i,j,1)
 
           if (_ALLOCATED(g_tracer%btf)) btm_src = (-g_tracer%btf(i,j)*dt)*kg_m2_to_H
+          g_tracer%field(i,j,nz,tau) = g_tracer%field(i,j,nz,tau) + btm_src/h_old(i,j,nz)
+         
+          ! Now solve the tridiagonal equation for the tracer concentrations.
+          ! Form the coefficients for using Press et.al. tridiagonal solver
+          do k=1,nz
+             a(k)= -(ea(i,j,k)+sink(k))/h_old(i,j,k)
+             c(k)= -eb(i,j,k)/h_old(i,j,k)
+             b(k)=  (h_old(i,j,k)+eb(i,j,k)+ea(i,j,k)+sink(k+1))/h_old(i,j,k)
+             f_old(k)= g_tracer%field(i,j,k,tau)
+          enddo
 
-          g_tracer%field(i,j,nz,tau) = b1 * ((h_old(i,j,nz) * g_tracer%field(i,j,nz,tau) + btm_src) + &
-               (ea(i,j,nz) + sink(nz)) * g_tracer%field(i,j,nz-1,tau))
+          call tridag_solver_Press_et_al(a,b,c,f_old,g_tracer%field(i,j,:,tau),nz)
 
           if (_ALLOCATED(g_tracer%btm_reservoir)) then 
              g_tracer%btm_reservoir(i,j) = g_tracer%btm_reservoir(i,j) + &
                  (sink(nz+1)*g_tracer%field(i,j,nz,tau))*H_to_kg_m2
           endif
-
-          do k=nz-1,1,-1
-             g_tracer%field(i,j,k,tau) = g_tracer%field(i,j,k,tau) + c1(k+1)*g_tracer%field(i,j,k+1,tau)
-          enddo
-
         endif !(g_tracer_com%grid_tmask(i,j,1) > 0.5)
-
     enddo; enddo ! i,j
 
-    !
-    !   Calculate the implicit vertical diffusion term
-    !   (Note: not sure if this needs any unit conversion)
-    !
-
-    if (do_diagnostic) then
-      do j = g_tracer_com%jsc, g_tracer_com%jec
-         do i = g_tracer_com%isc, g_tracer_com%iec
-            do k = 1, g_tracer_com%nk
-               g_tracer%vdiffuse_impl(i,j,k) = g_tracer_com%grid_tmask(i,j,k) *   &
-                    (g_tracer%field(i,j,k,tau) - g_tracer%vdiffuse_impl(i,j,k)) / dt
-            enddo
-         enddo
-      enddo
-    endif
-
   end subroutine g_tracer_vertdiff_G
+
+  subroutine tridag_solver_Press_et_al(a,b,c,r,u,n)
+    integer, intent(in) :: n
+    real,    intent(in) :: a(n),b(n),c(n),r(n)
+    real,    intent(inout) :: u(n)
+    real    :: bet,gam(n)
+    integer :: k
+    bet=b(1)
+    u(1)=r(1)/bet
+    do k=2,n
+       gam(k)=c(k-1)/bet
+       bet=b(k)-a(k)*gam(k)
+       u(k)=(r(k)-a(k)*u(k-1))/bet
+    enddo
+    do k=n-1,1,-1
+       u(k)=u(k)-gam(k+1)*u(k+1)
+    enddo
+  end subroutine tridag_solver_Press_et_al
 
   ! <SUBROUTINE NAME="g_tracer_vertdiff_M">
   !  <OVERVIEW>
