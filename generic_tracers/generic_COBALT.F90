@@ -1491,6 +1491,7 @@ namelist /generic_COBALT_nml/ do_14c, co2_calc, debug, do_nh3_atm_ocean_exchange
 
   ! identification numbers for mpp clocks
   integer :: id_clock_generic_COBALT_update_from_source
+  integer :: id_clock_doloops
   integer :: id_clock_carbon_calculations
   integer :: id_clock_phyto_growth
   integer :: id_clock_bacteria_growth
@@ -1545,7 +1546,7 @@ write (stdlogunit, generic_COBALT_nml)
   if (do_14c) then
     write (stdoutunit,*) trim(note_header), 'Simulating radiocarbon'
   endif
-
+  co2_calc=trim(co2_calc)
   if (trim(co2_calc) == 'ocmip2') then
     write (stdoutunit,*) trim(note_header), 'Using FMS OCMIP2 CO2 routine'
   else if (trim(co2_calc) == 'mocsy') then
@@ -1603,6 +1604,7 @@ write (stdlogunit, generic_COBALT_nml)
     call user_allocate_arrays
 
     id_clock_generic_COBALT_update_from_source = mpp_clock_id('(Cobalt: update_from_source)' ,grain=CLOCK_MODULE)
+    id_clock_doloops = mpp_clock_id('(Cobalt: doloops)' ,grain=CLOCK_MODULE)
     id_clock_carbon_calculations = mpp_clock_id('(Cobalt: carbon calcs)' ,grain=CLOCK_MODULE)
     id_clock_phyto_growth = mpp_clock_id('(Cobalt: phytoplankton growth calcs)',grain=CLOCK_MODULE)
     id_clock_bacteria_growth = mpp_clock_id('(Cobalt: bacteria growth calcs)',grain=CLOCK_MODULE)
@@ -6645,7 +6647,7 @@ write (stdlogunit, generic_COBALT_nml)
     ! Get positive tracer concentrations
     !---------------------------------------------------------------------
 
-    call mpp_clock_begin(id_clock_phyto_growth)
+!    call mpp_clock_begin(id_clock_phyto_growth)
 
     call g_tracer_get_values(tracer_list,'cadet_arag','field',f_cadet_arag ,isd,jsd,ntau=tau,positive=.true.)
     call g_tracer_get_values(tracer_list,'cadet_calc','field',f_cadet_calc ,isd,jsd,ntau=tau,positive=.true.)
@@ -6705,8 +6707,60 @@ write (stdlogunit, generic_COBALT_nml)
     !call g_tracer_get_values(tracer_list,'fedet_btf','field',f_fedet_btf,isd,jsd,ntau=1)
     call g_tracer_get_values(tracer_list,'irr_mem','field',f_irr_mem ,isd,jsd,ntau=1)
 
+    ! Create relevant light fields based on incident radiation and opacity
+    ! information passed from the ocean code
+    !
+    allocate(tmp_irr_band(nbands))
+    do j = jsc, jec ; do i = isc, iec   !{
+
+       do nb=1,nbands !{
+          if (max_wavelength_band(nb) .lt. 710.0) then !{
+             tmp_irr_band(nb) = sw_pen_band(nb,i,j)
+          else
+             tmp_irr_band(nb) = 0.0
+          endif !}
+       enddo !}
+
+       kblt = 0 ; tmp_irrad_ML = 0.0 ; tmp_hblt = 0.0
+       do k = 1, nk !{
+          tmp_irrad = 0.0
+          do nb=1,nbands !{
+             tmp_opacity = opacity_band(nb,i,j,k)
+             tmp_irrad = tmp_irrad + max(0.0,tmp_irr_band(nb) * exp(-tmp_opacity * dzt(i,j,k) * 0.5))
+             ! Change tmp_irr_band from being the value at the middle of layer k to the value
+             ! at the bottom of layer k.
+             tmp_irr_band(nb) = tmp_irr_band(nb) * exp(-tmp_opacity * dzt(i,j,k))
+          enddo !}
+          irr_inst(i,j,k) = tmp_irrad * grid_tmask(i,j,k)
+          irr_mix(i,j,k) = tmp_irrad * grid_tmask(i,j,k)
+          if ((k == 1) .or. (tmp_hblt .lt. hblt_depth(i,j))) then !{
+             kblt = kblt+1
+             tmp_irrad_ML = tmp_irrad_ML + irr_mix(i,j,k) * dzt(i,j,k)
+             tmp_hblt = tmp_hblt + dzt(i,j,k)
+          endif !}
+       enddo !} k-loop
+       irr_mix(i,j,1:kblt) = tmp_irrad_ML / max(1.0e-6,tmp_hblt)
+    enddo;  enddo !} i,j
+
+    deallocate(tmp_irr_band)
+    ! Calculate the depth for scaling of remineralization near the surface
+    allocate(z_remin_ramp(isd:ied,jsd:jed,1:nk)); z_remin_ramp = 0.0
+    z_remin_ramp(:,:,1) = dzt(:,:,1)
+    do k = 2,nk !{
+      z_remin_ramp(:,:,k) = z_remin_ramp(:,:,k-1) + dzt(:,:,k)
+    enddo !}k 
+
+    !nh3
+!This cannot be inside do concurrent 
+!NVFORTRAN-S-0488-Subprogram call in DO CONCURRENT is not PURE - calc_pka_nh3
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+       f_nh3(i,j,k) = f_nh4(i,j,k)/(1.+10**(calc_pka_nh3(temp(i,j,k),salt(i,j,k))+log10(min(max(f_htotal(i,j,1),1e-10),1e-5)))) * grid_tmask(i,j,k)
+    enddo;  enddo ; enddo !} i,j,k
+
+    call mpp_clock_begin(id_clock_doloops)
     ! zero out cumulative COBALT-wide production diagnostics
-    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        jprod_fed(i,j,k) = 0.0
        jprod_fedet(i,j,k) = 0.0
        jprod_ndet(i,j,k) = 0.0
@@ -6725,7 +6779,7 @@ write (stdlogunit, generic_COBALT_nml)
 ! added jgj - do we need it every timestep
        jremin_ndet(i,j,k) = 0.0
        jo2resp_wc(i,j,k) = 0.0
-    enddo;  enddo ;  enddo !} i,j,k
+!    enddo;  enddo ;  enddo !} i,j,k
 !
 !-----------------------------------------------------------------------------------
 ! 1: Phytoplankton growth and nutrient uptake calculations
@@ -6738,7 +6792,7 @@ write (stdlogunit, generic_COBALT_nml)
     !
     ! Calculate iron cell quota
     !
-    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
+!    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
        do n = 1,NUM_PHYTO    !{
           phyto(n)%q_fe_2_n(i,j,k) = max(0.0, phyto(n)%f_fe(i,j,k)/ &
                  max(epsln,phyto(n)%f_n(i,j,k)))
@@ -6776,11 +6830,11 @@ write (stdlogunit, generic_COBALT_nml)
           phyto(n)%def_fe(i,j,k) = phyto(n)%q_fe_2_n(i,j,k)**2.0 / (phyto(n)%k_fe_2_n**2.0 +  &
                phyto(n)%q_fe_2_n(i,j,k)**2.0)
        enddo !} n
-    enddo;  enddo ;  enddo !} i,j,k
+!    enddo;  enddo ;  enddo !} i,j,k
     !
     ! Calculate nutrient limitation based on the most limiting nutrient (liebig_lim)
     !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{        
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{        
        n=DIAZO
        phyto(n)%liebig_lim(i,j,k) = phyto(n)%o2lim(i,j,k)* &
           min(phyto(n)%po4lim(i,j,k), phyto(n)%def_fe(i,j,k))
@@ -6788,71 +6842,27 @@ write (stdlogunit, generic_COBALT_nml)
           phyto(n)%liebig_lim(i,j,k) = min(phyto(n)%no3lim(i,j,k)+phyto(n)%nh4lim(i,j,k),&
              phyto(n)%po4lim(i,j,k), phyto(n)%def_fe(i,j,k))
        enddo !} n
-    enddo;  enddo ;  enddo !} i,j,k
+!    enddo;  enddo ;  enddo !} i,j,k
     !
     !-----------------------------------------------------------------------
     ! 1.2: Light Limitation/Growth Calculations
     !-----------------------------------------------------------------------
     !
-    ! Create relevant light fields based on incident radiation and opacity
-    ! information passed from the ocean code
-    !
-    allocate(tmp_irr_band(nbands))
-    do j = jsc, jec ; do i = isc, iec   !{
 
-       do nb=1,nbands !{
-          if (max_wavelength_band(nb) .lt. 710.0) then !{
-             tmp_irr_band(nb) = sw_pen_band(nb,i,j)
-          else
-             tmp_irr_band(nb) = 0.0
-          endif !}
-       enddo !}
-
-       kblt = 0 ; tmp_irrad_ML = 0.0 ; tmp_hblt = 0.0
-       do k = 1, nk !{
-          tmp_irrad = 0.0
-          do nb=1,nbands !{
-             tmp_opacity = opacity_band(nb,i,j,k)
-             tmp_irrad = tmp_irrad + max(0.0,tmp_irr_band(nb) * exp(-tmp_opacity * dzt(i,j,k) * 0.5))
-             ! Change tmp_irr_band from being the value at the middle of layer k to the value
-             ! at the bottom of layer k.
-             tmp_irr_band(nb) = tmp_irr_band(nb) * exp(-tmp_opacity * dzt(i,j,k))
-          enddo !}
-          irr_inst(i,j,k) = tmp_irrad * grid_tmask(i,j,k)
-          irr_mix(i,j,k) = tmp_irrad * grid_tmask(i,j,k)
-          if ((k == 1) .or. (tmp_hblt .lt. hblt_depth(i,j))) then !{
-             kblt = kblt+1
-             tmp_irrad_ML = tmp_irrad_ML + irr_mix(i,j,k) * dzt(i,j,k)
-             tmp_hblt = tmp_hblt + dzt(i,j,k)
-          endif !}
-       enddo !} k-loop
-       irr_mix(i,j,1:kblt) = tmp_irrad_ML / max(1.0e-6,tmp_hblt)
-    enddo;  enddo !} i,j
-
-    deallocate(tmp_irr_band)
     !
     ! Calculate the temperature limitation (expkT) and the time integrated
     ! irradiance (f_irr_mem) to which the Chl:C ratio responds (~24 hours)
     !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{        
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{        
        expkT(i,j,k) = exp(kappa_eppley * Temp(i,j,k))
        f_irr_mem(i,j,k) = (f_irr_mem(i,j,k) + (irr_mix(i,j,k) - &
           f_irr_mem(i,j,k)) * min(1.0,gamma_irr_mem * dt)) * grid_tmask(i,j,k)
-    enddo; enddo ; enddo !} i,j,k
-
-    !nh3
-    if (do_nh3_diag) then
-    f_nh3(:,:,:) = 0.
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
-       f_nh3(i,j,k) = f_nh4(i,j,k)/(1.+10**(calc_pka_nh3(temp(i,j,k),salt(i,j,k))+log10(min(max(f_htotal(i,j,1),1e-10),1e-5)))) * grid_tmask(i,j,k)
-    enddo;  enddo ; enddo !} i,j,k
-    end if
-
+!    enddo; enddo ; enddo !} i,j,k
 
     !
     ! Phytoplankton growth rate calculation based on Geider et al. (1997)
     !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
        f_chl(i,j,k) = 0.0
 
        do n = 1, NUM_PHYTO   !{
@@ -6877,9 +6887,11 @@ write (stdlogunit, generic_COBALT_nml)
 
        enddo !} n
 
-    enddo;  enddo ; enddo !} i,j,k
+!    enddo;  enddo ; enddo !} i,j,k
+    enddo !concurrent i,j,k
 
-    do j = jsc, jec ; do i = isc, iec ; do n = 1,NUM_PHYTO !{
+    do j = jsc, jec ; do i = isc, iec
+     do n = 1,NUM_PHYTO !{
        kblt = 0 ; tmp_mu_ML = 0.0 ; tmp_hblt = 0.0
        do k = 1, nk !{
           if ((k == 1) .or. (tmp_hblt .lt. hblt_depth(i,j))) then !{
@@ -6889,7 +6901,8 @@ write (stdlogunit, generic_COBALT_nml)
           endif !}
        enddo !} k-loop
        phyto(n)%mu_mix(i,j,1:kblt) = tmp_mu_ML / max(epsln,tmp_hblt)
-    enddo;  enddo; enddo !} i,j,n
+     enddo
+    enddo; enddo !} i,j
 
     do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; do n = 1,NUM_PHYTO !{        
        phyto(n)%f_mu_mem(i,j,k) = phyto(n)%f_mu_mem(i,j,k) + (phyto(n)%mu_mix(i,j,k) - &
@@ -6902,7 +6915,8 @@ write (stdlogunit, generic_COBALT_nml)
     !
     ! Uptake of nitrate and ammonia
     !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        n = DIAZO
        phyto(n)%juptake_n2(i,j,k) =  max(0.0,(1.0 - phyto(n)%no3lim(i,j,k) - phyto(n)%nh4lim(i,j,k))* &
           phyto(n)%mu(i,j,k)*phyto(n)%f_n(i,j,k))
@@ -6923,11 +6937,11 @@ write (stdlogunit, generic_COBALT_nml)
           jprod_nh4(i,j,k) = jprod_nh4(i,j,k) - min(0.0,phyto(n)%mu(i,j,k)*phyto(n)%f_n(i,j,k))
           jo2resp_wc(i,j,k) = jo2resp_wc(i,j,k) - min(0.0,phyto(n)%mu(i,j,k)*phyto(n)%f_n(i,j,k))*o2_2_nh4
        enddo !} n
-    enddo;  enddo ; enddo !} i,j,k
+!    enddo;  enddo ; enddo !} i,j,k
     !
     ! Phosphorous uptake
     ! 
-    do k = 1, nk  ;    do j = jsc, jec ;      do i = isc, iec   !{
+!    do k = 1, nk  ;    do j = jsc, jec ;      do i = isc, iec   !{
        n=DIAZO
        phyto(n)%juptake_po4(i,j,k) = (phyto(n)%juptake_n2(i,j,k)+phyto(n)%juptake_nh4(i,j,k) + &
           phyto(n)%juptake_no3(i,j,k))*phyto(n)%p_2_n_static
@@ -6939,11 +6953,11 @@ write (stdlogunit, generic_COBALT_nml)
           jprod_po4(i,j,k) = jprod_po4(i,j,k) - &
                   min(0.0,phyto(n)%mu(i,j,k)*phyto(n)%f_n(i,j,k))*phyto(n)%p_2_n_static
        enddo !} n
-    enddo; enddo ; enddo !} i,j,k
+!    enddo; enddo ; enddo !} i,j,k
     !
     ! Iron uptake
     ! 
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
        do n = 1, NUM_PHYTO  !{
           if (phyto(n)%q_fe_2_n(i,j,k).lt.phyto(n)%fe_2_n_max) then
              phyto(n)%juptake_fe(i,j,k) = phyto(n)%P_C_max*expkT(i,j,k)*phyto(n)%f_n(i,j,k)* &
@@ -6952,11 +6966,11 @@ write (stdlogunit, generic_COBALT_nml)
              phyto(n)%juptake_fe(i,j,k) = 0.0
           endif
        enddo   !} n
-    enddo; enddo ; enddo !} i,j,k
+!    enddo; enddo ; enddo !} i,j,k
     !
     ! Silicate uptake
     !
-    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec   !{
+!    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec   !{
        nlg_diatoms(i,j,k)=phyto(LARGE)%f_n(i,j,k)*phyto(LARGE)%silim(i,j,k)
        q_si_2_n_lg_diatoms(i,j,k)= f_silg(i,j,k)/ &
              (nlg_diatoms(i,j,k) + epsln)
@@ -6967,9 +6981,9 @@ write (stdlogunit, generic_COBALT_nml)
        ! Note that this is si_2_n in large phytoplankton pool, not in diatoms themselves (q_si_2_n_lg_diatoms) 
        phyto(LARGE)%q_si_2_n(i,j,k) = f_silg(i,j,k)/(phyto(LARGE)%f_n(i,j,k)+epsln)
 
-    enddo; enddo ; enddo !} i,j,k
+!    enddo; enddo ; enddo !} i,j,k
 !
-    call mpp_clock_end(id_clock_phyto_growth)
+!    call mpp_clock_end(id_clock_phyto_growth)
 !
 !-----------------------------------------------------------------------
 ! 2: Bacterial Growth and Uptake Calculations 
@@ -6980,9 +6994,9 @@ write (stdlogunit, generic_COBALT_nml)
     ! from specified values of bact(1)%gge_max, bact(1)%mu_max and bact(1)%bresp
     !
 
-    call mpp_clock_begin(id_clock_bacteria_growth)
+!    call mpp_clock_begin(id_clock_bacteria_growth)
     vmax_bact = (1.0/bact(1)%gge_max)*(bact(1)%mu_max + bact(1)%bresp)
-    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec   !{
+!    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec   !{
        bact(1)%temp_lim(i,j,k) = exp(bact(1)%ktemp*Temp(i,j,k))
        bact(1)%ldonlim(i,j,k) = f_ldon(i,j,k)/(bact(1)%k_ldon + f_ldon(i,j,k))
        bact(1)%o2lim(i,j,k) = max(f_o2(i,j,k),o2_min)/  &
@@ -7016,9 +7030,10 @@ write (stdlogunit, generic_COBALT_nml)
        bact(1)%jprod_po4(i,j,k) = bact(1)%juptake_ldop(i,j,k) - max(bact(1)%jprod_n(i,j,k)*bact(1)%q_p_2_n,0.0)
        jprod_po4(i,j,k) = jprod_po4(i,j,k) + bact(1)%jprod_po4(i,j,k)
 
-    enddo; enddo ; enddo !} i,j,k
+    !enddo; enddo ; enddo !} i,j,k
+    enddo !concurrent i,j,k   
 !
-    call mpp_clock_end(id_clock_bacteria_growth)
+!    call mpp_clock_end(id_clock_bacteria_growth)
 !
 !-----------------------------------------------------------------------
 ! 3: Plankton foodweb dynamics
@@ -7028,7 +7043,7 @@ write (stdlogunit, generic_COBALT_nml)
     ! 3.1 Plankton foodweb dynamics: consumption by zooplankton and higher predators
     !
 
-    call mpp_clock_begin(id_clock_zooplankton_calculations)
+!    call mpp_clock_begin(id_clock_zooplankton_calculations)
 
     !
     ! Set-up local matrices for calculating zooplankton ingestion of
@@ -7111,7 +7126,8 @@ write (stdlogunit, generic_COBALT_nml)
     prey_si2n_vec(6) = 0.0
     prey_si2n_vec(7) = 0.0
 
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; !{
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; !{
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
 
        !
        ! 3.1.1: Calculate zooplankton ingestion fluxes
@@ -7328,15 +7344,15 @@ write (stdlogunit, generic_COBALT_nml)
          zoo(n)%jhploss_p(i,j,k) = zoo(n)%jhploss_n(i,j,k)*prey_p2n_vec(NUM_PHYTO+1+n)
        enddo !} n
 
-    enddo; enddo; enddo  !} i,j,k
-    call mpp_clock_end(id_clock_zooplankton_calculations)
+!    enddo; enddo; enddo  !} i,j,k
+!    call mpp_clock_end(id_clock_zooplankton_calculations)
 
     !
     ! 3.2: Plankton foodweb dynamics: Other mortality and loss terms
     !
 
-    call mpp_clock_begin(id_clock_other_losses)
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; !{
+!    call mpp_clock_begin(id_clock_other_losses)
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; !{
 
        !  
        ! 3.2.1 Calculate losses of phytoplankton to aggregation 
@@ -7381,15 +7397,15 @@ write (stdlogunit, generic_COBALT_nml)
           phyto(n)%jexuloss_fe(i,j,k) = phyto(n)%exu*max(phyto(n)%juptake_fe(i,j,k),0.0)
        enddo
 
-    enddo; enddo; enddo  !} i,j,k
-    call mpp_clock_end(id_clock_other_losses)
+!    enddo; enddo; enddo  !} i,j,k
+!    call mpp_clock_end(id_clock_other_losses)
 
     !
     ! 3.3: Plankton foodweb dynamics: Production calculations
     !
 
-    call mpp_clock_begin(id_clock_production_loop)
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+!    call mpp_clock_begin(id_clock_production_loop)
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
 
        !
        ! 3.3.1: Calculate the production of detritus and dissolved organic material
@@ -7563,22 +7579,22 @@ write (stdlogunit, generic_COBALT_nml)
        jprod_po4(i,j,k) = jprod_po4(i,j,k) + (1.0-hp_phi_det)*hp_jingest_p(i,j,k)
        jo2resp_wc(i,j,k) = jo2resp_wc(i,j,k) + (1.0-hp_phi_det)*hp_jingest_n(i,j,k)*o2_2_nh4
 
-    enddo; enddo ; enddo !} i,j,k
-    call mpp_clock_end(id_clock_production_loop)
+!    enddo; enddo ; enddo !} i,j,k
+!    call mpp_clock_end(id_clock_production_loop)
 
-    call mpp_clock_begin(id_clock_ballast_loops)
+!    call mpp_clock_begin(id_clock_ballast_loops)
 !
 !
 !------------------------------------------------------------------------------------
 ! 4: Production of calcium carbonate (Calcite and Aragonite) and lithogenic material
 !------------------------------------------------------------------------------------
 !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
 
     !
     ! 4.1: Calculate aragonite and calcite saturation states
     !
-       if (trim(co2_calc) == "ocmip2") then
+       if (co2_calc == "ocmip2") then
          TK = Temp(i,j,k) + 273.15
          PRESS = 0.1016 * zt(i,j,k) + 1.013
          PKSPA = 171.945 + 0.077993 * TK - 2903.293 / TK - 71.595 * log10(TK) - (-0.068393 + 1.7276e-3 * &
@@ -7595,22 +7611,23 @@ write (stdlogunit, generic_COBALT_nml)
             (PRESS - 1.013) / (382.92 * TK)
          co3_sol_calc(i,j,k) = 10**(-PKSPC) / (2.937d-4 * max(5.0, Salt(i,j,k)))
          omega_calc(i,j,k) = f_co3_ion(i,j,k) / co3_sol_calc(i,j,k)
-      else if (trim(co2_calc) == "mocsy") then
+      else if (co2_calc == "mocsy") then
          omega_arag(i,j,k) = omegaa(i,j,k)  ! from Mocsy
          omega_calc(i,j,k) = omegac(i,j,k)  ! from Mocsy
          co3_sol_arag(i,j,k) = f_co3_ion(i,j,k) / max(omega_arag(i,j,k),epsln)
          co3_sol_calc(i,j,k) = f_co3_ion(i,j,k) / max(omega_calc(i,j,k),epsln)
       else
-        call mpp_error(FATAL,"Unable to compute aragonite and calcite saturation states")
+        print*,"Unable to compute aragonite and calcite saturation states"
+        !call mpp_error(FATAL,"Unable to compute aragonite and calcite saturation states")
       endif
 
-    enddo; enddo ; enddo !} i,j,k
+!    enddo; enddo ; enddo !} i,j,k
 
     !
     ! 4.2: Calculate the production rate of aragonite and calcite detritus 
     !
 
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
         jprod_cadet_arag(i,j,k) = (zoo(2)%jzloss_n(i,j,k)*zoo(3)%phi_det + &
                        (zoo(2)%jhploss_n(i,j,k) + zoo(3)%jhploss_n(i,j,k))*hp_phi_det)* &
                        ca_2_n_arag*min(caco3_sat_max, max(0.0,omega_arag(i,j,k) - 1.0)) + epsln 
@@ -7618,17 +7635,17 @@ write (stdlogunit, generic_COBALT_nml)
                        phyto(SMALL)%jzloss_n(i,j,k)*zoo(1)%phi_det + phyto(LARGE)%jzloss_n(i,j,k)*zoo(3)%phi_det + &  
                        phyto(SMALL)%jaggloss_n(i,j,k) + phyto(LARGE)%jaggloss_n(i,j,k))*ca_2_n_calc* &
                        min(caco3_sat_max, max(0.0, omega_calc(i,j,k) - 1.0)) + epsln
-    enddo; enddo ; enddo !} i,j,k
+!    enddo; enddo ; enddo !} i,j,k
 
     !
     ! 4.3: Lithogenic detritus production (repackaged from f_lith during filter feeding)
     !
 
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
        jprod_lithdet(i,j,k)=( total_filter_feeding(i,j,k)/ &
                                    ( phyto(LARGE)%f_n(i,j,k) + phyto(DIAZO)%f_n(i,j,k) + epsln ) * &  
                                     phi_lith + k_lith ) * f_lith(i,j,k)
-    enddo; enddo ; enddo !} i,j,k
+!    enddo; enddo ; enddo !} i,j,k
 
 !
 !---------------------------------------------------------------------------------------------------------
@@ -7640,7 +7657,7 @@ write (stdlogunit, generic_COBALT_nml)
     ! 5.1: Dissolution of aragonite, calcite and opal detrital particles
     !
 
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        jdiss_cadet_arag(i,j,k) = gamma_cadet_arag * & 
          max(0.0, 1.0 - omega_arag(i,j,k)) * f_cadet_arag(i,j,k)
        jdiss_cadet_calc(i,j,k) = gamma_cadet_calc * &
@@ -7649,23 +7666,17 @@ write (stdlogunit, generic_COBALT_nml)
        jdiss_sidet(i,j,k) = gamma_sidet * exp(kappa_sidet * &
           Temp(i,j,k)) * f_sidet(i,j,k)
        jprod_sio4(i,j,k) = jprod_sio4(i,j,k) + jdiss_sidet(i,j,k)
-    enddo; enddo ; enddo !} i,j,k
+!    enddo; enddo ; enddo !} i,j,k
 
     !
     ! 5.2: Remineralization of nitrogen, phosphorous and iron detritus accounting for oxygen 
     !      and mineral protection 
     !
 
-    ! Calculate the depth for scaling of remineralization near the surface
-    allocate(z_remin_ramp(isd:ied,jsd:jed,1:nk)); z_remin_ramp = 0.0
-    z_remin_ramp(:,:,1) = dzt(:,:,1)
-    do k = 2,nk !{
-      z_remin_ramp(:,:,k) = z_remin_ramp(:,:,k-1) + dzt(:,:,k)
-    enddo !}k 
 !
 !---------------------------------------------------------------------------------------------------------
 
-    do k=1,nk ; do j=jsc,jec ; do i=isc,iec  !{
+!    do k=1,nk ; do j=jsc,jec ; do i=isc,iec  !{
        expkreminT(i,j,k) = exp(kappa_remin * Temp(i,j,k))
        !jno3denit_wc(i,j,k) = 0.0
        !
@@ -7704,9 +7715,8 @@ write (stdlogunit, generic_COBALT_nml)
        jremin_fedet(i,j,k) = jremin_ndet(i,j,k) / (f_ndet(i,j,k) + epsln) * &
          remin_eff_fedet*f_fedet(i,j,k)
        jprod_fed(i,j,k) = jprod_fed(i,j,k) + jremin_fedet(i,j,k) 
-    enddo; enddo; enddo  !} i,j,k
+!    enddo; enddo; enddo  !} i,j,k
 
-    deallocate(z_remin_ramp)
 !
 !
 !--------------------------------------------------------------------------------------------
@@ -7717,7 +7727,7 @@ write (stdlogunit, generic_COBALT_nml)
        !
        !  Nitrification
        !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
        jnitrif(i,j,k) = 0.0
        if (scheme_nitrif .eq. 2 .or. scheme_nitrif .eq. 3) then             
           if (f_o2(i,j,k) .gt. o2_min_nit) then  !{
@@ -7739,7 +7749,7 @@ write (stdlogunit, generic_COBALT_nml)
           end if
        end if
        jo2resp_wc(i,j,k) = jo2resp_wc(i,j,k) + jnitrif(i,j,k)*o2_2_nitrif
-    enddo; enddo; enddo  !} i,j,k
+!    enddo; enddo; enddo  !} i,j,k
 
 !
 !
@@ -7751,7 +7761,7 @@ write (stdlogunit, generic_COBALT_nml)
     ! 
     ! Iron scavenging and coastal sources
     !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
        kfe_eq_lig(i,j,k) = min(kfe_eq_lig_ll, 10.0**( log10(kfe_eq_lig_hl) + &
           max(0.0,log10(io_fescav/max(epsln,irr_inst(i,j,k)))) ) ) 
 
@@ -7778,7 +7788,9 @@ write (stdlogunit, generic_COBALT_nml)
        ! uncomment if running "no mass change" test
        !jfe_ads(i,j,k) = 0.0
 
-    enddo; enddo; enddo  !} i,j,k
+    !enddo; enddo; enddo  !} i,j,k
+    enddo !concurrent i,j,k
+    deallocate(z_remin_ramp)
 
 !
 !-------------------------------------------------------------------------------------------------
@@ -7796,7 +7808,8 @@ write (stdlogunit, generic_COBALT_nml)
     !     !jfe_coast(i,j,k) = 0.0
     !enddo; enddo; enddo  !} i,j,k
 
-    do j = jsc, jec; do i = isc, iec  !{
+    !do j = jsc, jec; do i = isc, iec  !{
+    do concurrent(j=jsc:jec,i=isc:iec)
        k = grid_kmt(i,j)
        if (k .gt. 0) then !{
           !
@@ -7940,13 +7953,15 @@ write (stdlogunit, generic_COBALT_nml)
           b_sio4(i,j)= - f_sidet_btf(i,j,1)
 
        endif !}
-    enddo; enddo  !} i, j
+    !enddo; enddo  !} i, j
+    enddo !concurrent i,j
+    call mpp_clock_end(id_clock_doloops)
 
     do k = 2, nk ; do j = jsc, jec ; do i = isc, iec   !{
        f_cased(i,j,k) = 0.0
     enddo; enddo ; enddo  !} i,j,k
 
-    call mpp_clock_end(id_clock_ballast_loops)
+!    call mpp_clock_end(id_clock_ballast_loops)
 
     call g_tracer_set_values(tracer_list,'alk',  'btf', b_alk ,isd,jsd)
     call g_tracer_set_values(tracer_list,'dic',  'btf', b_dic ,isd,jsd)
@@ -7957,7 +7972,7 @@ write (stdlogunit, generic_COBALT_nml)
     call g_tracer_set_values(tracer_list,'po4',  'btf', b_po4 ,isd,jsd)
     call g_tracer_set_values(tracer_list,'sio4', 'btf', b_sio4,isd,jsd)
 !
-    call mpp_clock_begin(id_clock_source_sink_loop1)
+    !call mpp_clock_begin(id_clock_source_sink_loop1)
 !
 !-----------------------------------------------------------------------
 ! 8: Source/sink calculations 
@@ -8017,7 +8032,9 @@ write (stdlogunit, generic_COBALT_nml)
     allocate(pre_totfe(isc:iec,jsc:jec,1:nk))
     allocate(net_srcfe(isc:iec,jsc:jec,1:nk))
     allocate(pre_totsi(isc:iec,jsc:jec,1:nk))
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    call mpp_clock_begin(id_clock_doloops)
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
          pre_totn(i,j,k) = (p_no3(i,j,k,tau) + p_nh4(i,j,k,tau) + & 
                     p_ndi(i,j,k,tau) + p_nlg(i,j,k,tau) + &
                     p_nsm(i,j,k,tau) + p_nbact(i,j,k,tau) + &
@@ -8050,17 +8067,12 @@ write (stdlogunit, generic_COBALT_nml)
          net_srcfe(i,j,k) = jfe_coast(i,j,k)*dt*grid_tmask(i,j,k)
          pre_totsi(i,j,k) = (p_sio4(i,j,k,tau) + p_silg(i,j,k,tau) + &
                     p_sidet(i,j,k,tau))*grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
-    do j = jsc, jec ; do i = isc, iec  !{
+    !enddo; enddo ; enddo  !} i,j,k
+    !do j = jsc, jec ; do i = isc, iec  !{
       net_srcfe(i,j,1) = net_srcfe(i,j,1)+ffe_iceberg(i,j)*dt*grid_tmask(i,j,1)/rho_dzt(i,j,1)
-    enddo; enddo
+    !enddo; enddo
 
-    if (id_no3_in_source .gt. 0)                &
-         used = g_send_data(id_no3_in_source,         f_no3,          &
-         model_time, rmask = grid_tmask,& 
-         is_in=isc, js_in=jsc, ks_in=1,ie_in=iec, je_in=jec, ke_in=nk)
-
-    call mpp_clock_end(id_clock_source_sink_loop1)
+    !call mpp_clock_end(id_clock_source_sink_loop1)
     !
     !-----------------------------------------------------------------------
     ! 4.2: Source sink calculations
@@ -8068,8 +8080,8 @@ write (stdlogunit, generic_COBALT_nml)
     !
     !     Phytoplankton Nitrogen and Phosphorus
     !
-    call mpp_clock_begin(id_clock_source_sink_loop2)
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !call mpp_clock_begin(id_clock_source_sink_loop2)
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Diazotrophic Phytoplankton Nitrogen
        !
@@ -8094,14 +8106,14 @@ write (stdlogunit, generic_COBALT_nml)
                             phyto(SMALL)%jaggloss_n(i,j,k) - phyto(SMALL)%jvirloss_n(i,j,k) -      &
                             phyto(SMALL)%jexuloss_n(i,j,k)                                         
        p_nsm(i,j,k,tau) = p_nsm(i,j,k,tau) + jnsm(i,j,k)*dt*grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
+!    enddo; enddo ; enddo  !} i,j,k
 !
-    call mpp_clock_end(id_clock_source_sink_loop2)
+!    call mpp_clock_end(id_clock_source_sink_loop2)
     !
     !     Phytoplankton Silicon and Iron
     !
-    call mpp_clock_begin(id_clock_source_sink_loop3)
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+!    call mpp_clock_begin(id_clock_source_sink_loop3)
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Large Phytoplankton Silicon
        !
@@ -8139,14 +8151,14 @@ write (stdlogunit, generic_COBALT_nml)
        jnbact(i,j,k) = bact(1)%jprod_n(i,j,k) - bact(1)%jzloss_n(i,j,k) - &
                               bact(1)%jvirloss_n(i,j,k) - bact(1)%jhploss_n(i,j,k)  
        p_nbact(i,j,k,tau) = p_nbact(i,j,k,tau) + jnbact(i,j,k)*dt*grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
+    !enddo; enddo ; enddo  !} i,j,k
 
-    call mpp_clock_end(id_clock_source_sink_loop3)
+    !call mpp_clock_end(id_clock_source_sink_loop3)
     !
     !    Zooplankton 
     !
-    call mpp_clock_begin(id_clock_source_sink_loop4)
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !call mpp_clock_begin(id_clock_source_sink_loop4)
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Small zooplankton
        !
@@ -8165,23 +8177,23 @@ write (stdlogunit, generic_COBALT_nml)
        jnlgz(i,j,k) = zoo(3)%jprod_n(i,j,k) - zoo(3)%jzloss_n(i,j,k) - &
                              zoo(3)%jhploss_n(i,j,k)
        p_nlgz(i,j,k,tau) = p_nlgz(i,j,k,tau) + jnlgz(i,j,k)*dt*grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
+    !enddo; enddo ; enddo  !} i,j,k
 !
-    call mpp_clock_end(id_clock_source_sink_loop4)
+    !call mpp_clock_end(id_clock_source_sink_loop4)
     !
     !     NO3
     !
-    call mpp_clock_begin(id_clock_source_sink_loop5)
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !call mpp_clock_begin(id_clock_source_sink_loop5)
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        jno3(i,j,k) =  jnitrif(i,j,k) - phyto(DIAZO)%juptake_no3(i,j,k) -  &
                              phyto(LARGE)%juptake_no3(i,j,k) - phyto(SMALL)%juptake_no3(i,j,k) - &
                              jno3denit_wc(i,j,k)
        p_no3(i,j,k,tau) = p_no3(i,j,k,tau) + jno3(i,j,k)*dt*grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
+    !enddo; enddo ; enddo  !} i,j,k
     !
     !     Other nutrients
     !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! NH4
        !
@@ -8200,10 +8212,10 @@ write (stdlogunit, generic_COBALT_nml)
        !
        jsio4(i,j,k) = jprod_sio4(i,j,k) - phyto(LARGE)%juptake_sio4(i,j,k)
        p_sio4(i,j,k,tau) = p_sio4(i,j,k,tau) + jsio4(i,j,k) * dt * grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
+    !enddo; enddo ; enddo  !} i,j,k
 
     ! 2016/06/13 JGJ: keep original Fed calculation
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
           !
           ! Fed
           ! use original code to compute jprod_fed, jfed and p_fed
@@ -8213,16 +8225,16 @@ write (stdlogunit, generic_COBALT_nml)
                             phyto(LARGE)%juptake_fe(i,j,k) -  phyto(SMALL)%juptake_fe(i,j,k) - &
                             jfe_ads(i,j,k)
        p_fed(i,j,k,tau) = p_fed(i,j,k,tau) + jfed(i,j,k) * dt * grid_tmask(i,j,k)
-    enddo; enddo; enddo  !} i,j,k
+    !enddo; enddo; enddo  !} i,j,k
 
-    call mpp_clock_end(id_clock_source_sink_loop5)
+    !call mpp_clock_end(id_clock_source_sink_loop5)
     !
     !-----------------------------------------------------------------------
     !     Detrital Components
     !-----------------------------------------------------------------------
     !
-    call mpp_clock_begin(id_clock_source_sink_loop6)
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !call mpp_clock_begin(id_clock_source_sink_loop6)
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Cadet_arag
        !
@@ -8258,10 +8270,10 @@ write (stdlogunit, generic_COBALT_nml)
                               jdiss_sidet(i,j,k) - det_jzloss_si(i,j,k) - &
                               det_jhploss_si(i,j,k)
        p_sidet(i,j,k,tau) = p_sidet(i,j,k,tau) + jsidet(i,j,k)*dt*grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
+    !enddo; enddo ; enddo  !} i,j,k
 
     ! 2016/06/13 JGJ: keep original jfedet calculation
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
           !
           ! Fedet
           ! use original code to compute fedet
@@ -8271,11 +8283,11 @@ write (stdlogunit, generic_COBALT_nml)
                               jremin_fedet(i,j,k) - det_jzloss_fe(i,j,k) - & 
                               det_jhploss_fe(i,j,k)
        p_fedet(i,j,k,tau) = p_fedet(i,j,k,tau) + jfedet(i,j,k)*dt*grid_tmask(i,j,k) 
-    enddo; enddo; enddo  !} i,j,k
+    !enddo; enddo; enddo  !} i,j,k
     !
     !     Dissolved Organic Matter
     !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Labile Dissolved Organic Nitrogen
        !
@@ -8318,11 +8330,11 @@ write (stdlogunit, generic_COBALT_nml)
        jsrdop(i,j,k) = jprod_srdop(i,j,k) - gamma_srdop * f_srdop(i,j,k)
        p_srdop(i,j,k,tau) = p_srdop(i,j,k,tau) + jsrdop(i,j,k) * dt *                &
                                   grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
+    !enddo; enddo ; enddo  !} i,j,k
     !
     !     O2
     !
-    do k = 1, nk ; do j =jsc, jec ; do i = isc, iec  !{
+    !do k = 1, nk ; do j =jsc, jec ; do i = isc, iec  !{
        jo2(i,j,k) = (o2_2_no3 * (phyto(DIAZO)%juptake_no3(i,j,k) +   &
             phyto(LARGE)%juptake_no3(i,j,k) + phyto(SMALL)%juptake_no3(i,j,k)) + & 
              o2_2_nh4 *       &
@@ -8331,11 +8343,11 @@ write (stdlogunit, generic_COBALT_nml)
             phyto(DIAZO)%juptake_n2(i,j,k))) * grid_tmask(i,j,k)
        jo2(i,j,k) = jo2(i,j,k) - jo2resp_wc(i,j,k)
        p_o2(i,j,k,tau) = p_o2(i,j,k,tau) + jo2(i,j,k) * dt * grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
+    !enddo; enddo ; enddo  !} i,j,k
     !
     !     The Carbon system
     !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Alkalinity
        ! CAS: remove o2 removal via nitrification from the total o2 respired 
@@ -8359,9 +8371,27 @@ write (stdlogunit, generic_COBALT_nml)
           jdiss_cadet_arag(i,j,k) + jdiss_cadet_calc(i,j,k) - &
           jprod_cadet_arag(i,j,k) - jprod_cadet_calc(i,j,k))
        p_dic(i,j,k,tau) = p_dic(i,j,k,tau) + jdic(i,j,k) * dt * grid_tmask(i,j,k)
-    enddo; enddo ; enddo !} i,j,k
+    !enddo; enddo ; enddo !} i,j,k
+    !
+    !-----------------------------------------------------------------------
+    !     Lithogenic aluminosilicate particulates
+    !-----------------------------------------------------------------------
+    !
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+       p_lith(i,j,k,tau) = p_lith(i,j,k,tau) - jlithdet(i,j,k) * dt *        &
+            grid_tmask(i,j,k)
+    !enddo; enddo ; enddo  !} i,j,k
+    !call mpp_clock_end(id_clock_source_sink_loop6)
+    enddo !concurrent i,j,k
+    call mpp_clock_end(id_clock_doloops)
 !
-       
+
+!    call mpp_clock_begin(id_clock_doloops)
+!    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+!    enddo !concurrent i,j,k
+!    call mpp_clock_end(id_clock_doloops)
+ 
+      
     if (do_14c) then                                        !<<RADIOCARBON
 
          do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
@@ -8436,23 +8466,13 @@ write (stdlogunit, generic_COBALT_nml)
          * grid_tmask(i,j,k)
      enddo; enddo ; enddo !} i,j,k
     endif                                                   !RADIOCARBON>>
-    !
-    !-----------------------------------------------------------------------
-    !     Lithogenic aluminosilicate particulates
-    !-----------------------------------------------------------------------
-    !
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
-       p_lith(i,j,k,tau) = p_lith(i,j,k,tau) - jlithdet(i,j,k) * dt *        &
-            grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
-    call mpp_clock_end(id_clock_source_sink_loop6)
     call mpp_clock_begin(id_clock_cobalt_calc_diagnostics)
     !
     !Set the diagnostics tracer fields.
     !
     call g_tracer_set_values(tracer_list,'cased',  'field',f_cased    ,isd,jsd,ntau=1)
     call g_tracer_set_values(tracer_list,'chl',    'field',f_chl      ,isd,jsd,ntau=1)
-    if (do_nh3_diag) call g_tracer_set_values(tracer_list,'nh3',    'field',f_nh3      ,isd,jsd,ntau=1)
+    call g_tracer_set_values(tracer_list,'nh3',    'field',f_nh3      ,isd,jsd,ntau=1)
     call g_tracer_set_values(tracer_list,'co3_ion','field',f_co3_ion  ,isd,jsd,ntau=1)
     call g_tracer_set_values(tracer_list,'irr_mem' ,'field',f_irr_mem ,isd,jsd,ntau=1)
     call g_tracer_set_values(tracer_list,'mu_mem_ndi' ,'field',phyto(DIAZO)%f_mu_mem ,isd,jsd,ntau=1)
@@ -8467,7 +8487,9 @@ write (stdlogunit, generic_COBALT_nml)
     allocate(post_totp(isc:iec,jsc:jec,1:nk))
     allocate(post_totsi(isc:iec,jsc:jec,1:nk))
     allocate(post_totfe(isc:iec,jsc:jec,1:nk))
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    call mpp_clock_begin(id_clock_doloops)
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
          post_totn(i,j,k) = (p_no3(i,j,k,tau) + p_nh4(i,j,k,tau) + &
                     p_ndi(i,j,k,tau) + p_nlg(i,j,k,tau) + &
                     p_nsm(i,j,k,tau) + p_nbact(i,j,k,tau) + &
@@ -8477,8 +8499,8 @@ write (stdlogunit, generic_COBALT_nml)
                     p_nlgz(i,j,k,tau))*grid_tmask(i,j,k)
          imbal = (post_totn(i,j,k) - pre_totn(i,j,k) - net_srcn(i,j,k))*86400.0/dt*1.03e6
          if (abs(imbal).gt.1.0e-10) then
-           call mpp_error(FATAL,&
-           '==>biological source/sink imbalance (generic_COBALT_update_from_source): Nitrogen')
+           !call mpp_error(FATAL,&
+           print*,'==>biological source/sink imbalance (generic_COBALT_update_from_source): Nitrogen'!)
          endif
 
          post_totc(i,j,k) = (p_dic(i,j,k,tau) + &
@@ -8491,8 +8513,8 @@ write (stdlogunit, generic_COBALT_nml)
                     p_nlgz(i,j,k,tau)))*grid_tmask(i,j,k)
         imbal = (post_totc(i,j,k) - pre_totc(i,j,k))*86400.0/dt*1.03e6
          if (abs(imbal).gt.1.0e-10) then
-           call mpp_error(FATAL,&
-           '==>biological source/sink imbalance (generic_COBALT_update_from_source): Carbon')
+           !call mpp_error(FATAL,&
+           print*,'==>biological source/sink imbalance (generic_COBALT_update_from_source): Carbon'!)
          endif
 
          post_totp(i,j,k) = (p_po4(i,j,k,tau) + p_ndi(i,j,k,tau)*phyto(1)%p_2_n_static + &
@@ -8506,8 +8528,8 @@ write (stdlogunit, generic_COBALT_nml)
                     bact(1)%q_p_2_n*p_nbact(i,j,k,tau))*grid_tmask(i,j,k)
          imbal = (post_totp(i,j,k) - pre_totp(i,j,k))*86400.0/dt*1.03e6
          if (abs(imbal).gt.1.0e-10) then
-           call mpp_error(FATAL,&
-           '==>biological source/sink imbalance (generic_COBALT_update_from_source): Phosphorus')
+           !call mpp_error(FATAL,&
+           print*,'==>biological source/sink imbalance (generic_COBALT_update_from_source): Phosphorus'!)
          endif
 
          post_totfe(i,j,k) = (p_fed(i,j,k,tau) + p_fedi(i,j,k,tau) + &
@@ -8515,18 +8537,20 @@ write (stdlogunit, generic_COBALT_nml)
                     p_fedet(i,j,k,tau))*grid_tmask(i,j,k)
          imbal = (post_totfe(i,j,k) - pre_totfe(i,j,k) - net_srcfe(i,j,k))*86400.0/dt*1.03e6
          if (abs(imbal).gt.1.0e-10) then
-           call mpp_error(FATAL,&
-           '==>biological source/sink imbalance (generic_COBALT_update_from_source): Iron')
+           !call mpp_error(FATAL,&
+           print*,'==>biological source/sink imbalance (generic_COBALT_update_from_source): Iron'!)
          endif
 
          post_totsi(i,j,k) = (p_sio4(i,j,k,tau) + p_silg(i,j,k,tau) + &
                     p_sidet(i,j,k,tau))*grid_tmask(i,j,k)
          imbal = (post_totsi(i,j,k) - pre_totsi(i,j,k))*86400.0/dt*1.03e6
          if (abs(imbal).gt.1.0e-10) then
-           call mpp_error(FATAL,&
-           '==>biological source/sink imbalance (generic_COBALT_update_from_source): Silica')
+           !call mpp_error(FATAL,&
+           print*,'==>biological source/sink imbalance (generic_COBALT_update_from_source): Silica'!)
          endif
-    enddo; enddo ; enddo  !} i,j,k
+    enddo !concurrent i,j,k
+    call mpp_clock_end(id_clock_doloops)
+!    enddo; enddo ; enddo  !} i,j,k
  
 
     !
@@ -8576,7 +8600,9 @@ write (stdlogunit, generic_COBALT_nml)
     enddo; enddo ; enddo  !} i,j,k
 
     ! O2 saturation
-    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
+    call mpp_clock_begin(id_clock_doloops)
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+!    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
        sal = min(42.0,max(0.0,Salt(i,j,k)))
        tt = 298.15 - min(40.0,max(0.0,Temp(i,j,k)))
        tkb = 273.15 + min(40.0,max(0.0,Temp(i,j,k)))
@@ -8591,8 +8617,7 @@ write (stdlogunit, generic_COBALT_nml)
             exp( a_0 + a_1*ts + a_2*ts2 + a_3*ts3 + a_4*ts4 + a_5*ts5 + &
             (b_0 + b_1*ts + b_2*ts2 + b_3*ts3 + c_0*sal)*sal)
 
-    enddo; enddo ; enddo  !} i,j,k
-
+!    enddo; enddo ; enddo  !} i,j,k
     !
     !---------------------------------------------------------------------
     ! Calculate total carbon  = Dissolved Inorganic Carbon + Phytoplankton Carbon
@@ -8604,61 +8629,64 @@ write (stdlogunit, generic_COBALT_nml)
     ! nitrogen is added to represent the refractory component.
     !---------------------------------------------------------------------
     !
-    tot_layer_int_c(:,:,:) = (p_dic(:,:,:,tau) + doc_background + p_cadet_arag(:,:,:,tau) +&
-         p_cadet_calc(:,:,:,tau) + c_2_n * (p_ndi(:,:,:,tau) + p_nlg(:,:,:,tau) +      &
-         p_nsm(:,:,:,tau) + p_nbact(:,:,:,tau) + &
-         p_ldon(:,:,:,tau) + p_sldon(:,:,:,tau) + p_srdon(:,:,:,tau) +  &
-         p_ndet(:,:,:,tau) + p_nsmz(:,:,:,tau) + p_nmdz(:,:,:,tau) + &
-         p_nlgz(:,:,:,tau))) * rho_dzt(:,:,:)
+    tot_layer_int_c(i,j,k) = (p_dic(i,j,k,tau) + doc_background + p_cadet_arag(i,j,k,tau) +&
+         p_cadet_calc(i,j,k,tau) + c_2_n * (p_ndi(i,j,k,tau) + p_nlg(i,j,k,tau) +      &
+         p_nsm(i,j,k,tau) + p_nbact(i,j,k,tau) + &
+         p_ldon(i,j,k,tau) + p_sldon(i,j,k,tau) + p_srdon(i,j,k,tau) +  &
+         p_ndet(i,j,k,tau) + p_nsmz(i,j,k,tau) + p_nmdz(i,j,k,tau) + &
+         p_nlgz(i,j,k,tau))) * rho_dzt(i,j,k)
 
-    tot_layer_int_fe(:,:,:) = (p_fed(:,:,:,tau) + p_fedi(:,:,:,tau) + &
-         p_felg(:,:,:,tau) + p_fesm(:,:,:,tau) + & 
-         p_fedet(:,:,:,tau)) * rho_dzt(:,:,:) 
+    tot_layer_int_fe(i,j,k) = (p_fed(i,j,k,tau) + p_fedi(i,j,k,tau) + &
+         p_felg(i,j,k,tau) + p_fesm(i,j,k,tau) + & 
+         p_fedet(i,j,k,tau)) * rho_dzt(i,j,k) 
 
-    tot_layer_int_n(:,:,:) = (p_no3(:,:,:,tau) + &
-         p_nh4(:,:,:,tau) + p_ndi(:,:,:,tau) + p_nlg(:,:,:,tau) + &
-         p_nsm(:,:,:,tau) + p_nbact(:,:,:,tau) + &
-         p_ldon(:,:,:,tau) + p_sldon(:,:,:,tau) + p_srdon(:,:,:,tau) +  p_ndet(:,:,:,tau) + &
-         p_nsmz(:,:,:,tau) + p_nmdz(:,:,:,tau) + p_nlgz(:,:,:,tau)) * & 
-         rho_dzt(:,:,:)
+    tot_layer_int_n(i,j,k) = (p_no3(i,j,k,tau) + &
+         p_nh4(i,j,k,tau) + p_ndi(i,j,k,tau) + p_nlg(i,j,k,tau) + &
+         p_nsm(i,j,k,tau) + p_nbact(i,j,k,tau) + &
+         p_ldon(i,j,k,tau) + p_sldon(i,j,k,tau) + p_srdon(i,j,k,tau) +  p_ndet(i,j,k,tau) + &
+         p_nsmz(i,j,k,tau) + p_nmdz(i,j,k,tau) + p_nlgz(i,j,k,tau)) * & 
+         rho_dzt(i,j,k)
 
-    tot_layer_int_p(:,:,:) = (p_po4(:,:,:,tau) + &
-         p_ndi(:,:,:,tau)*phyto(1)%p_2_n_static + &
-         p_nlg(:,:,:,tau)*phyto(2)%p_2_n_static + &
-         p_nsm(:,:,:,tau)*phyto(3)%p_2_n_static + &
-         p_ldop(:,:,:,tau) + p_sldop(:,:,:,tau) + &
-         p_srdop(:,:,:,tau) + p_pdet(:,:,:,tau) + &
-         bact(1)%q_p_2_n*p_nbact(:,:,:,tau) + zoo(1)%q_p_2_n*p_nsmz(:,:,:,tau) +  &
-         zoo(2)%q_p_2_n*p_nmdz(:,:,:,tau) + zoo(3)%q_p_2_n*p_nlgz(:,:,:,tau))  &
-         * rho_dzt(:,:,:)
+    tot_layer_int_p(i,j,k) = (p_po4(i,j,k,tau) + &
+         p_ndi(i,j,k,tau)*phyto(1)%p_2_n_static + &
+         p_nlg(i,j,k,tau)*phyto(2)%p_2_n_static + &
+         p_nsm(i,j,k,tau)*phyto(3)%p_2_n_static + &
+         p_ldop(i,j,k,tau) + p_sldop(i,j,k,tau) + &
+         p_srdop(i,j,k,tau) + p_pdet(i,j,k,tau) + &
+         bact(1)%q_p_2_n*p_nbact(i,j,k,tau) + zoo(1)%q_p_2_n*p_nsmz(i,j,k,tau) +  &
+         zoo(2)%q_p_2_n*p_nmdz(i,j,k,tau) + zoo(3)%q_p_2_n*p_nlgz(i,j,k,tau))  &
+         * rho_dzt(i,j,k)
 
-    tot_layer_int_si(:,:,:) = (p_sio4(:,:,:,tau) + p_silg(:,:,:,tau) +   &
-         p_sidet(:,:,:,tau)) * rho_dzt(:,:,:)
+    tot_layer_int_si(i,j,k) = (p_sio4(i,j,k,tau) + p_silg(i,j,k,tau) +   &
+         p_sidet(i,j,k,tau)) * rho_dzt(i,j,k)
 
-    tot_layer_int_o2(:,:,:) = p_o2(:,:,:,tau)*rho_dzt(:,:,:)
+    tot_layer_int_o2(i,j,k) = p_o2(i,j,k,tau)*rho_dzt(i,j,k)
 
-    tot_layer_int_alk(:,:,:) = p_alk(:,:,:,tau)*rho_dzt(:,:,:)
+    tot_layer_int_alk(i,j,k) = p_alk(i,j,k,tau)*rho_dzt(i,j,k)
 
 ! CHECK3
     !add background of 42 uM (as in other parts of cobalt)- may need to change to 3.8e-5 per JPD
-    tot_layer_int_dic(:,:,:) = p_dic(:,:,:,tau)*rho_dzt(:,:,:)
+    tot_layer_int_dic(i,j,k) = p_dic(i,j,k,tau)*rho_dzt(i,j,k)
 
 ! CHECK3
 ! CAS: spreadsheet indicates no background, should we remove it?
-    tot_layer_int_doc(:,:,:) = doc_background +  c_2_n * (p_ldon(:,:,:,tau) + p_sldon(:,:,:,tau) +  &
-         p_srdon(:,:,:,tau)) * rho_dzt(:,:,:)
+    tot_layer_int_doc(i,j,k) = doc_background +  c_2_n * (p_ldon(i,j,k,tau) + p_sldon(i,j,k,tau) +  &
+         p_srdon(i,j,k,tau)) * rho_dzt(i,j,k)
 
-   tot_layer_int_poc(:,:,:) = (p_ndi(:,:,:,tau) + p_nlg(:,:,:,tau) + p_nsm(:,:,:,tau) + &
-         p_nbact(:,:,:,tau) + p_ndet(:,:,:,tau) + p_nsmz(:,:,:,tau) + p_nmdz(:,:,:,tau) + &
-         p_nlgz(:,:,:,tau))*c_2_n*rho_dzt(:,:,:)
-
+   tot_layer_int_poc(i,j,k) = (p_ndi(i,j,k,tau) + p_nlg(i,j,k,tau) + p_nsm(i,j,k,tau) + &
+         p_nbact(i,j,k,tau) + p_ndet(i,j,k,tau) + p_nsmz(i,j,k,tau) + p_nmdz(i,j,k,tau) + &
+         p_nlgz(i,j,k,tau))*c_2_n*rho_dzt(i,j,k)
+    enddo !concurrent i,j,k
+    call mpp_clock_end(id_clock_doloops)
 
     !
     !---------------------------------------------------------------------
     ! calculate water column vertical integrals for diagnostics
     !---------------------------------------------------------------------
     !
-    do j = jsc, jec ; do i = isc, iec !{
+    call mpp_clock_begin(id_clock_doloops)
+    do concurrent(j=jsc:jec,i=isc:iec)
+!    do j = jsc, jec ; do i = isc, iec !{
        wc_vert_int_c(i,j) = 0.0
        wc_vert_int_dic(i,j) = 0.0
        wc_vert_int_doc(i,j) = 0.0
@@ -8679,8 +8707,9 @@ write (stdlogunit, generic_COBALT_nml)
        wc_vert_int_jprod_nh4(i,j) = 0.0
        wc_vert_int_juptake_no3(i,j) = 0.0
        wc_vert_int_nfix(i,j) = 0.0
-    enddo; enddo !} i,j
-    do j = jsc, jec ; do i = isc, iec ; do k = 1, nk  !{
+!    enddo; enddo !} i,j
+!    do j = jsc, jec ; do i = isc, iec ; 
+       do k = 1, nk  !{
           wc_vert_int_c(i,j) = wc_vert_int_c(i,j) + tot_layer_int_c(i,j,k)*grid_tmask(i,j,k)
           wc_vert_int_dic(i,j) = wc_vert_int_dic(i,j) + tot_layer_int_dic(i,j,k)*grid_tmask(i,j,k)
           wc_vert_int_doc(i,j) = wc_vert_int_doc(i,j) + tot_layer_int_doc(i,j,k)*grid_tmask(i,j,k)
@@ -8715,13 +8744,20 @@ write (stdlogunit, generic_COBALT_nml)
              rho_dzt(i,j,k) * grid_tmask(i,j,k)
           wc_vert_int_nfix(i,j) = wc_vert_int_nfix(i,j) + phyto(DIAZO)%juptake_n2(i,j,k) *&
              rho_dzt(i,j,k) * grid_tmask(i,j,k)
-    enddo; enddo; enddo  !} i,j,k
+       enddo
+    !enddo; enddo  !} i,j,k
+    enddo !concurrent i,j,k
+    call mpp_clock_end(id_clock_doloops)
     !
     !---------------------------------------------------------------------
     ! Add external bottom fluxes to specific rates  
     !---------------------------------------------------------------------
     !
-    do j = jsc, jec ; do i = isc, iec ; do k = 1, nk  !{
+    allocate(rho_dzt_100(isc:iec,jsc:jec))
+    call mpp_clock_begin(id_clock_doloops)
+    do concurrent(j=jsc:jec,i=isc:iec)    
+   !do j = jsc, jec ; do i = isc, iec ; 
+     do k = 1, nk  !{
        ! CAS added calcite and aragonite redisolution terms 
        jdiss_cadet_calc_plus_btm(i,j,k)  = jdiss_cadet_calc(i,j,k)
        jdiss_cadet_arag_plus_btm(i,j,k)  = jdiss_cadet_arag(i,j,k)
@@ -8736,9 +8772,10 @@ write (stdlogunit, generic_COBALT_nml)
        jpo4_plus_btm(i,j,k)  = jpo4(i,j,k) 
        jsio4_plus_btm(i,j,k) = jsio4(i,j,k) 
        jdin_plus_btm(i,j,k)  = jno3(i,j,k) + jnh4(i,j,k)
-    enddo; enddo; enddo  !} i,j,k
+     enddo
+!    enddo; enddo  !} i,j,k
 
-    do j = jsc, jec ; do i = isc, iec  !{
+!    do j = jsc, jec ; do i = isc, iec  !{
        k = grid_kmt(i,j)
        if (k .gt. 0) then !{
 
@@ -8783,12 +8820,12 @@ write (stdlogunit, generic_COBALT_nml)
           jdin_plus_btm(i,j,k)  = jno3_plus_btm(i,j,k) + jnh4_plus_btm(i,j,k) 
           
        endif !}
-    enddo; enddo  !} i, j
+!    enddo; enddo  !} i, j
 
 !
 ! CHECK3 Remineralization of Organic Carbon, remoc=(jprod_nh4*c_2_n/dht) for k=1,kbot-1 + (jprod_nh4+f_ndet_btf-fndet_burial)*c_2_n/dht for k=kbot
 ! CAS: will code this up when I address denitrification issue
-    do j = jsc, jec ; do i = isc, iec  !{
+!    do j = jsc, jec ; do i = isc, iec  !{
        kbot = grid_kmt(i,j)
        if (kbot .gt. 0) then !{
        do k = 1, kbot-1  !{
@@ -8796,18 +8833,17 @@ write (stdlogunit, generic_COBALT_nml)
        enddo  !} k
        remoc(i,j,kbot) = (jprod_nh4(i,j,kbot) + f_ndet_btf(i,j,1) - fndet_burial(i,j)) * c_2_n / dzt(i,j,kbot)
        endif !}
-    enddo; enddo  !} i, j
+!    enddo; enddo  !} i, j
 
 
 !****************************************************************************************************
 
-    allocate(rho_dzt_100(isc:iec,jsc:jec))
     !
     !---------------------------------------------------------------------
     ! calculate upper 100 m vertical integrals
     !---------------------------------------------------------------------
     !
-    do j = jsc, jec ; do i = isc, iec !{
+!    do j = jsc, jec ; do i = isc, iec !{
        rho_dzt_100(i,j) = rho_dzt(i,j,1)
        f_alk_int_100(i,j) = p_alk(i,j,1,tau) * rho_dzt(i,j,1)
        f_dic_int_100(i,j) = p_dic(i,j,1,tau) * rho_dzt(i,j,1)
@@ -8891,9 +8927,9 @@ write (stdlogunit, generic_COBALT_nml)
        fsidet_100(i,j) = f_sidet(i,j,1) * Rho_0 * wsink
        fcadet_arag_100(i,j) = f_cadet_arag(i,j,1) * Rho_0 * wsink
        fcadet_calc_100(i,j) = f_cadet_calc(i,j,1) * Rho_0 * wsink
-    enddo; enddo !} i,j
+!    enddo; enddo !} i,j
 
-    do j = jsc, jec ; do i = isc, iec ; !{
+!    do j = jsc, jec ; do i = isc, iec ; !{
        k_100 = 1
        do k = 2, grid_kmt(i,j)  !{
           if (rho_dzt_100(i,j) .lt. Rho_0 * 100.0) then 
@@ -9127,14 +9163,14 @@ write (stdlogunit, generic_COBALT_nml)
 
        jprod_allphytos_100(i,j) = phyto(SMALL)%jprod_n_100(i,j) + phyto(LARGE)%jprod_n_100(i,j) + &
           phyto(DIAZO)%jprod_n_100(i,j) 
-    enddo ; enddo  !} i,j
+!    enddo ; enddo  !} i,j
 
     !
     ! Calculate biomass-weighted nutrient and light limitation terms for CMIP6  
     ! Note: these need to be done after other 100m integrals because the biomass
     ! weighting requires the pre-calculated 100m biomass
     !
-    do j = jsc, jec ; do i = isc, iec !{
+!    do j = jsc, jec ; do i = isc, iec !{
        rho_dzt_100(i,j) = rho_dzt(i,j,1)
        do n = 1,NUM_PHYTO
           phyto(n)%nlim_bw_100(i,j) = (phyto(n)%no3lim(i,j,1)+phyto(n)%nh4lim(i,j,1))* &
@@ -9146,9 +9182,9 @@ write (stdlogunit, generic_COBALT_nml)
           phyto(n)%irrlim_bw_100(i,j) = phyto(n)%irrlim(i,j,1)* &
                 phyto(n)%f_n(i,j,1)*rho_dzt(i,j,1)/(phyto(n)%f_n_100(i,j)+epsln)
        enddo   !} n
-    enddo; enddo  !} i, j
+!    enddo; enddo  !} i, j
 
-    do j = jsc, jec ; do i = isc, iec ; !{
+!    do j = jsc, jec ; do i = isc, iec ; !{
        k_100 = 1
        do k = 2, grid_kmt(i,j)  !{
           if (rho_dzt_100(i,j) .lt. Rho_0 * 100.0) then 
@@ -9182,7 +9218,10 @@ write (stdlogunit, generic_COBALT_nml)
                 phyto(n)%f_n(i,j,k_100)*drho_dzt/phyto(n)%f_n_100(i,j)
           enddo
         endif
-    enddo; enddo  !} i, j
+!    enddo; enddo  !} i, j
+    enddo !concurrent i,j,k
+    call mpp_clock_end(id_clock_doloops)   
+
     deallocate(rho_dzt_100)
 
     do j = jsc, jec ; do i = isc, iec ; !{
@@ -9204,13 +9243,15 @@ write (stdlogunit, generic_COBALT_nml)
     !---------------------------------------------------------------------
     !
     allocate(rho_dzt_200(isc:iec,jsc:jec))
-    do j = jsc, jec ; do i = isc, iec !{
+    !do j = jsc, jec ; do i = isc, iec !{
+    call mpp_clock_begin(id_clock_doloops)
+    do concurrent(j=jsc:jec,i=isc:iec)
        rho_dzt_200(i,j) = rho_dzt(i,j,1)
        jprod_mesozoo_200(i,j) = (zoo(2)%jprod_n(i,j,1) + zoo(3)%jprod_n(i,j,1))*rho_dzt(i,j,1)
        f_mesozoo_200(i,j) = (zoo(2)%f_n(i,j,1)+zoo(3)%f_n(i,j,1))*rho_dzt(i,j,1)
-    enddo; enddo !} i,j
+!    enddo; enddo !} i,j
 
-    do j = jsc, jec ; do i = isc, iec ; !{
+!    do j = jsc, jec ; do i = isc, iec ; !{
        k_200 = 1
        do k = 2, grid_kmt(i,j)  !{
           if (rho_dzt_200(i,j) .lt. Rho_0 * 200.0) then
@@ -9230,7 +9271,9 @@ write (stdlogunit, generic_COBALT_nml)
           f_mesozoo_200(i,j) = f_mesozoo_200(i,j) + &
               (zoo(2)%f_n(i,j,k_200)+zoo(3)%f_n(i,j,k_200))*drho_dzt
        endif
-    enddo ; enddo  !} i,j
+    enddo !concurrent i,j,k
+    call mpp_clock_end(id_clock_doloops)
+!    enddo ; enddo  !} i,j
 
     call g_tracer_get_values(tracer_list,'alk','runoff_tracer_flux',runoff_flux_alk,isd,jsd)
     call g_tracer_get_values(tracer_list,'dic','runoff_tracer_flux',runoff_flux_dic,isd,jsd)
@@ -9272,6 +9315,11 @@ write (stdlogunit, generic_COBALT_nml)
 
     call mpp_clock_end(id_clock_cobalt_calc_diagnostics)
     call mpp_clock_begin(id_clock_cobalt_send_diagnostics)
+
+    if (id_no3_in_source .gt. 0)                &
+         used = g_send_data(id_no3_in_source,         f_no3,          &
+         model_time, rmask = grid_tmask,& 
+         is_in=isc, js_in=jsc, ks_in=1,ie_in=iec, je_in=jec, ke_in=nk)
 
     if (id_pka_nh3 .gt. 0) then
        used = g_send_data(id_pka_nh3,  pka_nh3,   &
@@ -12337,7 +12385,7 @@ write (stdlogunit, generic_COBALT_nml)
     allocate(co3_sol_arag(isd:ied, jsd:jed, 1:nk)) ; co3_sol_arag=0.0
     allocate(co3_sol_calc(isd:ied, jsd:jed, 1:nk)) ; co3_sol_calc=0.0
     allocate(f_chl(isd:ied, jsd:jed, 1:nk))        ; f_chl=0.0
-    if (do_nh3_diag) allocate(f_nh3(isd:ied, jsd:jed, 1:nk))        ; f_nh3=0.0
+    allocate(f_nh3(isd:ied, jsd:jed, 1:nk))        ; f_nh3=0.0
     allocate(f_co3_ion(isd:ied, jsd:jed, 1:nk))    ; f_co3_ion=0.0
     allocate(f_htotal(isd:ied, jsd:jed, 1:nk))     ; f_htotal=0.0
     allocate(f_irr_mem(isd:ied, jsd:jed, 1:nk))    ; f_irr_mem=0.0
@@ -12804,7 +12852,7 @@ write (stdlogunit, generic_COBALT_nml)
     deallocate(co3_sol_arag)  
     deallocate(co3_sol_calc)  
     deallocate(f_chl)  
-    if (allocated(f_nh3)) deallocate(f_nh3)
+    deallocate(f_nh3)
     deallocate(f_co3_ion)  
     deallocate(f_htotal)  
     deallocate(f_irr_mem)  
