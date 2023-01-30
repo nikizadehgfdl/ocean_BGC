@@ -147,6 +147,7 @@ module generic_COBALT
   use g_tracer_utils, only : g_diag_type, g_diag_field_add
   use g_tracer_utils, only : register_diag_field=>g_register_diag_field
   use g_tracer_utils, only : g_send_data, is_root_pe
+  use g_tracer_utils, only : g_tracer_is_prog, g_tracer_vert_fill, g_tracer_get_next
 
   use FMS_ocmip2_co2calc_mod, only : FMS_ocmip2_co2calc, CO2_dope_vector
 
@@ -6673,7 +6674,19 @@ write (stdlogunit, generic_COBALT_nml)
 
     real :: imbal
     integer :: stdoutunit, imbal_flag, outunit
+    type(g_tracer_type), pointer :: g_tracer,g_tracer_next
+    real :: KD_SMOOTH = 1.0E-06
 
+    g_tracer => tracer_list        
+    do  
+     if(g_tracer_is_prog(g_tracer)) then
+       call g_tracer_vert_fill(g_tracer, dzt, KD_SMOOTH*dt, tau=1)
+     endif
+     !traverse the linked list till hit NULL
+     call g_tracer_get_next(g_tracer, g_tracer_next)
+     if(.NOT. associated(g_tracer_next)) exit
+     g_tracer=>g_tracer_next  
+    enddo
 
     r_dt = 1.0 / dt
 
