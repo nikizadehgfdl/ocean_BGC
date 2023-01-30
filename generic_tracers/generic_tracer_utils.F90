@@ -365,6 +365,7 @@ module g_tracer_utils
   public :: g_tracer_get_next
   public :: g_tracer_register_diag
   public :: g_tracer_is_prog
+  public :: g_tracer_vert_fill
   public :: g_tracer_vertdiff_G
   public :: g_tracer_vertdiff_M
   public :: g_tracer_start_param_list
@@ -3072,6 +3073,77 @@ contains
     g_tracer_next => g_tracer%next
   end subroutine g_tracer_get_next
 
+  !> Returns tracer arrays (nominally T and S) with massless layers filled with
+  !! sensible values, by diffusing vertically with a small but constant diffusivity.
+  subroutine g_tracer_vert_fill(g_tracer, h, kappa_dt, tau, larger_h_denom)
+    type(g_tracer_type),    pointer  :: g_tracer
+    real, dimension(g_tracer_com%isd:,g_tracer_com%jsd:,:), intent(in) :: h
+    real,                   intent(in) :: kappa_dt
+    integer,                intent(in) :: tau
+    logical,      optional, intent(in) :: larger_h_denom !< Present and true, add a large
+    !! enough minimal thickness in the denominator of
+    !! the flux calculations so that the fluxes are
+    !! never so large as eliminate the transmission
+    !! of information across groups of massless layers.
+    ! Local variables
+    real :: ent(1:g_tracer_com%nk+1)  ! The diffusive entrainment (kappa*dt)/dz
+    ! between layers in a timestep [H ~> m or kg m-2].
+    real :: b1              ! A variable used by the tridiagonal solver [H-1 ~> m-1 or m2 kg-1]
+    real :: d1              ! A variable used by the tridiagonal solver [nondim], d1 = 1 - c1.
+    real :: c1(1:g_tracer_com%nk)     ! A variable used by the tridiagonal solver [nondim].
+    real :: kap_dt_x2                ! The 2*kappa_dt converted to H units [H2 ~> m2 or kg2 m-4].
+    real :: h_neglect                ! A negligible thickness [H ~> m or kg m-2], to allow for zero thicknesses.
+    real :: h0                       ! A negligible thickness to allow for zero thickness layers without
+    ! completely decoupling groups of layers [H ~> m or kg m-2].
+    ! Often 0 < h_neglect << h0.
+    real :: h_tr                     ! h_tr is h at tracer points with a tiny thickness
+    ! added to ensure positive definiteness [H ~> m or kg m-2].
+    integer :: i, j, k, is, ie, js, je, nz
+
+    h_neglect = 1.0e-20 !GV%H_subroundoff
+    kap_dt_x2 = (2.0*kappa_dt) !*GV%Z_to_H**2
+    h0 = h_neglect
+    if (present(larger_h_denom)) then
+       if (larger_h_denom) h0 = 1.0e-16*sqrt(kappa_dt) !*GV%Z_to_H
+    endif
+
+    if (kap_dt_x2 > 0.0) then
+       do j=g_tracer_com%jsc,g_tracer_com%jec ; do i=g_tracer_com%isc,g_tracer_com%iec
+       if (g_tracer_com%grid_tmask(i,j,1) > 0.5) then
+          ent(2) = kap_dt_x2 / ((h(i,j,1)+h(i,j,2)) + h0)
+          h_tr = h(i,j,1) + h_neglect
+          b1 = 1.0 / (h_tr + ent(2))
+          d1 = b1 * h_tr
+          g_tracer%field(i,j,1,tau) = b1*h_tr*g_tracer%field(i,j,1,tau)
+          
+          do k=2,nz-1
+             ent(K+1) = kap_dt_x2 / ((h(i,j,k)+h(i,j,k+1)) + h0) !eb(k+1)=ea(k)=ent(k)
+             h_tr = h(i,j,k) + h_neglect 
+             c1(k) = ent(K) * b1 !eb(k-1)*b1
+             b1 = 1.0 / ((h_tr + d1*ent(K)) + ent(K+1))  
+             d1 = b1 * (h_tr + d1*ent(K))
+             g_tracer%field(i,j,k,tau) = b1 * (h_tr   * g_tracer%field(i,j,k,tau) + &
+                                               ent(K) * g_tracer%field(i,j,k-1,tau))
+             
+             !T_f(i,j,k) = b1(i) * (h_tr*T_in(i,j,k) + ent(i,K)*T_f(i,j,k-1))
+          enddo
+          c1(nz) = ent(nz) * b1
+          h_tr = h(i,j,nz) + h_neglect
+          b1 = 1.0 / (h_tr + d1*ent(nz))
+          g_tracer%field(i,j,nz,tau) = b1 * (h_tr    * g_tracer%field(i,j,nz,tau) + &
+                                             ent(nz) * g_tracer%field(i,j,nz-1,tau))
+          !T_f(i,j,nz) = b1(i) * (h_tr*T_in(i,j,nz) + ent(i,nz)*T_f(i,j,nz-1))
+          
+          do k=nz-1,1,-1
+             g_tracer%field(i,j,k,tau) = g_tracer%field(i,j,k,tau) + c1(k+1)*g_tracer%field(i,j,k+1,tau)
+             !T_f(i,j,k) = T_f(i,j,k) + c1(i,k+1)*T_f(i,j,k+1)
+          enddo
+       endif
+       enddo;enddo
+    endif
+
+  end subroutine g_tracer_vert_fill
+  
   ! <SUBROUTINE NAME="g_tracer_vertdiff_G">
   !  <OVERVIEW>
   !   Vertical Diffusion of a tracer node

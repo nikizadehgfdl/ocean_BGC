@@ -44,7 +44,7 @@ module generic_tracer
   use g_tracer_utils, only : g_tracer_type, g_tracer_init, g_diag_type
   use g_tracer_utils, only : g_tracer_get_common, g_tracer_set_common, g_tracer_is_prog
   use g_tracer_utils, only : g_tracer_coupler_set,g_tracer_coupler_get, g_tracer_register_diag
-  use g_tracer_utils, only : g_tracer_vertdiff_M, g_tracer_vertdiff_G, g_tracer_get_next     
+  use g_tracer_utils, only : g_tracer_vertdiff_M, g_tracer_vertdiff_G, g_tracer_get_next, g_tracer_vert_fill     
   use g_tracer_utils, only : g_tracer_diag, g_tracer_print_info
   use g_tracer_utils, only : g_tracer_coupler_accumulate
 
@@ -634,7 +634,7 @@ contains
     real,                   intent(in) :: dt, kg_m2_to_H, m_to_H
     integer,                intent(in) :: tau
     type(g_tracer_type), pointer    :: g_tracer,g_tracer_next
-
+    real :: KD_SMOOTH = 1.0E-06
     !nnz: Should I loop here or inside the sub g_tracer_vertdiff ?    
     !JGJ 2013/05/31  merged COBALT into siena_201303
     if(do_generic_abiotic .or. do_generic_age .or. do_generic_argon .or. do_generic_CFC .or. do_generic_SF6 .or. do_generic_TOPAZ &
@@ -643,9 +643,10 @@ contains
        g_tracer => tracer_list        
        !Go through the list of tracers 
        do  
-          if(g_tracer_is_prog(g_tracer)) &
+          if(g_tracer_is_prog(g_tracer)) then
+             call g_tracer_vert_fill(g_tracer, h_old, KD_SMOOTH*dt, tau)
              call g_tracer_vertdiff_G(g_tracer,h_old, ea, eb, dt, kg_m2_to_H, m_to_H, tau)
-
+          endif
           !traverse the linked list till hit NULL
           call g_tracer_get_next(g_tracer, g_tracer_next)
           if(.NOT. associated(g_tracer_next)) exit
