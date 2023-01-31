@@ -192,6 +192,7 @@ module generic_COBALT
   logical :: do_14c             = .false.
   logical :: debug              = .false.
   logical :: do_nh3_atm_ocean_exchange = .false. 
+  logical :: do_vert_fill = .false.
   real    :: k_nh4_small = 1.e-8
   real    :: k_nh4_diazo = 1.e-7
   real    :: k_nh4_large = 5.e-8
@@ -213,8 +214,7 @@ module generic_COBALT
 
 namelist /generic_COBALT_nml/ do_14c, co2_calc, debug, do_nh3_atm_ocean_exchange, scheme_nitrif, &
      k_nh4_small,k_nh4_large,k_nh4_diazo,scheme_no3_nh4_lim,k_no3_small,k_no3_large,k_no3_diazo, &
-     o2_min_nit,k_o2_nit,irr_inhibit,k_nh3_nitrif, &
-     gamma_nitrif
+     o2_min_nit,k_o2_nit,irr_inhibit,k_nh3_nitrif,gamma_nitrif,do_vert_fill
 
   ! Declare phytoplankton, zooplankton and cobalt variable types, which contain
   ! the vast majority of all variables used in this module. 
@@ -6677,16 +6677,18 @@ write (stdlogunit, generic_COBALT_nml)
     type(g_tracer_type), pointer :: g_tracer,g_tracer_next
     real :: KD_SMOOTH = 1.0E-06
 
-    g_tracer => tracer_list        
-    do  
-     if(g_tracer_is_prog(g_tracer)) then
-       call g_tracer_vert_fill(g_tracer, dzt, KD_SMOOTH*dt, tau=1)
-     endif
-     !traverse the linked list till hit NULL
-     call g_tracer_get_next(g_tracer, g_tracer_next)
-     if(.NOT. associated(g_tracer_next)) exit
-     g_tracer=>g_tracer_next  
-    enddo
+    if(do_vert_fill) then
+      g_tracer => tracer_list        
+      do  
+       if(g_tracer_is_prog(g_tracer)) then
+         call g_tracer_vert_fill(g_tracer, dzt, KD_SMOOTH*dt, tau=1)
+       endif
+       !traverse the linked list till hit NULL
+       call g_tracer_get_next(g_tracer, g_tracer_next)
+       if(.NOT. associated(g_tracer_next)) exit
+       g_tracer=>g_tracer_next  
+      enddo
+    endif
 
     r_dt = 1.0 / dt
 
