@@ -255,8 +255,11 @@ else
 end if
 
 
-
-
+  if (present(co3_ion))  co3_ion(:,:) = 0.0
+  if (present(co2star))  co2star(:,:) = 0.0
+  if (present(alpha))    alpha(:,:) = 0.0
+  if (present(pco2surf)) pCO2surf(:,:) = 0.0
+ 
 ! Set the loop indices.
   isc = dope_vec%isc ; iec = dope_vec%iec
   jsc = dope_vec%jsc ; jec = dope_vec%jec
@@ -266,12 +269,12 @@ end if
 !
   log100 = log(100.0)
 
-  do j = jsc, jec  !{
-    do i = isc, iec  !{
-      if (mask(i,j) .gt. 0.0) then  !{
 
-        if (trim(co2_calc_method) == 'mocsy') then
+  if (trim(co2_calc_method) == 'mocsy') then
 
+    do j = jsc, jec  !{
+     do i = isc, iec  !{
+      if (mask(i,j) .le. 0.0) cycle
           ! Initialize Mocsy input arrays
           Patm  = 0. 
           depth = 0. 
@@ -341,8 +344,13 @@ end if
           if (present(pCO2surf))  pCO2surf(i,j)  = pco2(1)
           if (present(omega_arag)) omega_arag(i,j) = OmegaA(1)
           if (present(omega_calc)) omega_calc(i,j) = OmegaC(1)
+    enddo  !} i
+  enddo  !} j
  
         else if (trim(co2_calc_method) == 'ocmip2') then
+    do j = jsc, jec  !{
+     do i = isc, iec  !{
+      if (mask(i,j) .le. 0.0) cycle
 !
 !---------------------------------------------------------------------
 !
@@ -530,30 +538,13 @@ end if
           pCO2surf(i,j) = co2star_internal / (alpha_internal * permeg)
         endif
       
+
+    enddo  !} i
+  enddo  !} j
       else
         call mpp_error(FATAL,"CO2 calculation was not invoked.")    
       endif !} mocsy vs. ocmip2
 
-    else  !}{mask(i,j)=0.0
-
-      if (present(co3_ion)) then
-        co3_ion(i,j) = 0.0
-      endif
-      if (present(co2star)) then
-        co2star(i,j) = 0.0
-      endif
-      if (present(alpha)) then  !{
-        alpha(i,j) = 0.0
-      endif  !}
-      if (present(pco2surf)) then  !{
-        pCO2surf(i,j) = 0.0
-      endif  !}
-
-
-    endif  !}mask
-
-    enddo  !} i
-  enddo  !} j
 
 
 return

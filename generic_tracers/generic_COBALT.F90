@@ -129,7 +129,7 @@ module generic_COBALT
   use coupler_types_mod, only: coupler_2d_bc_type
   use field_manager_mod, only: fm_string_len, fm_path_name_len
   use mpp_mod,           only: mpp_clock_id, mpp_clock_begin, mpp_clock_end
-  use mpp_mod,           only: CLOCK_COMPONENT, CLOCK_SUBCOMPONENT, CLOCK_MODULE
+  use mpp_mod,           only: CLOCK_COMPONENT, CLOCK_SUBCOMPONENT, CLOCK_MODULE, mpp_sum
   use mpp_mod,           only: input_nml_file, mpp_error, stdlog, NOTE, WARNING, FATAL, stdout, mpp_chksum
   use time_manager_mod,  only: time_type
   use fm_util_mod,       only: fm_util_start_namelist, fm_util_end_namelist  
@@ -209,7 +209,7 @@ module generic_COBALT
   integer :: scheme_nitrif = 3 !1-default COBALT
                                !2-update with no temperature dependence
                                !3-update with temperature dependence
-  integer :: nthreads=4
+  integer :: nthreads=2
 
 namelist /generic_COBALT_nml/ do_14c, co2_calc, debug, do_nh3_atm_ocean_exchange, scheme_nitrif, &
      k_nh4_small,k_nh4_large,k_nh4_diazo,scheme_no3_nh4_lim,k_no3_small,k_no3_large,k_no3_diazo, &
@@ -1498,6 +1498,7 @@ namelist /generic_COBALT_nml/ do_14c, co2_calc, debug, do_nh3_atm_ocean_exchange
   integer :: id_clock_generic_COBALT_update_from_source
   integer :: id_clock_generic_COBALT_openmp
   integer :: id_clock_carbon_calculations
+  integer :: id_clock_carbon_calculations2
   integer :: id_clock_phyto_growth
   integer :: id_clock_bacteria_growth
   integer :: id_clock_zooplankton_calculations
@@ -1614,6 +1615,7 @@ write (stdlogunit, generic_COBALT_nml)
     call user_allocate_arrays
 
     id_clock_carbon_calculations = mpp_clock_id('(Cobalt: carbon calcs)' ,grain=CLOCK_MODULE)
+    id_clock_carbon_calculations2 = mpp_clock_id('(Cobalt: carbon calcs2)' ,grain=CLOCK_MODULE)
     id_clock_phyto_growth = mpp_clock_id('(Cobalt: phytoplankton growth calcs)',grain=CLOCK_MODULE)
     id_clock_bacteria_growth = mpp_clock_id('(Cobalt: bacteria growth calcs)',grain=CLOCK_MODULE)
     id_clock_zooplankton_calculations = mpp_clock_id('(Cobalt: zooplankton calculations)',grain=CLOCK_MODULE)
@@ -6569,6 +6571,7 @@ write (stdlogunit, generic_COBALT_nml)
        cobalt%htotalhi(i,j) = cobalt%htotal_scale_hi * cobalt%f_htotal(i,j,k)
     enddo; enddo ; !} i, j
 
+    call mpp_clock_begin(id_clock_carbon_calculations2)
 
     call FMS_ocmip2_co2calc(CO2_dope_vec,grid_tmask(:,:,k),&
          Temp(:,:,k), Salt(:,:,k),                    &
@@ -6612,6 +6615,7 @@ write (stdlogunit, generic_COBALT_nml)
             omega_arag=cobalt%omegaa(:,:,k), &
             omega_calc=cobalt%omegac(:,:,k))
     enddo
+    call mpp_clock_end(id_clock_carbon_calculations2)
 
     call g_tracer_set_values(tracer_list,'htotal','field',cobalt%f_htotal  ,isd,jsd,ntau=1)
     call g_tracer_set_values(tracer_list,'co3_ion','field',cobalt%f_co3_ion  ,isd,jsd,ntau=1)
@@ -6748,9 +6752,9 @@ write (stdlogunit, generic_COBALT_nml)
     call mpp_clock_begin(id_clock_loop1)
 
 !$ call omp_set_num_threads(nthreads);
-!$omp parallel do !collapse(3) !loop1
-    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
-!    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+!c$omp parallel do !collapse(3) !loop1
+!    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        cobalt%jprod_fed(i,j,k) = 0.0
        cobalt%jprod_fedet(i,j,k) = 0.0
        cobalt%jprod_ndet(i,j,k) = 0.0
@@ -6832,7 +6836,7 @@ write (stdlogunit, generic_COBALT_nml)
           phyto(n)%liebig_lim(i,j,k) = min(phyto(n)%no3lim(i,j,k)+phyto(n)%nh4lim(i,j,k),&
              phyto(n)%po4lim(i,j,k), phyto(n)%def_fe(i,j,k))
        enddo !} n
-    enddo ;  enddo ;  enddo !} i,j,k
+    enddo !;  enddo ;  enddo !} i,j,k
     call mpp_clock_end(id_clock_loop1)
 
     !
@@ -6845,7 +6849,7 @@ write (stdlogunit, generic_COBALT_nml)
     !
     call mpp_clock_begin(id_clock_loop1_1)
     allocate(tmp_irr_band(nbands))
-!$omp parallel do !collapse(3) !loop2
+!c$omp parallel do !collapse(3) !loop2
     do j = jsc, jec ; do i = isc, iec   !{
 !    do concurrent(j=jsc:jec,i=isc:iec)
 
@@ -6884,7 +6888,7 @@ write (stdlogunit, generic_COBALT_nml)
     ! Calculate the temperature limitation (expkT) and the time integrated
     ! irradiance (f_irr_mem) to which the Chl:C ratio responds (~24 hours)
     !
-!$omp parallel do !collapse(3) !loop2
+!c$omp parallel do !collapse(3) !loop2
     do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{        
 !    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        cobalt%expkT(i,j,k) = exp(cobalt%kappa_eppley * Temp(i,j,k))
@@ -6905,7 +6909,7 @@ write (stdlogunit, generic_COBALT_nml)
     ! Phytoplankton growth rate calculation based on Geider et al. (1997)
     !
     call mpp_clock_begin(id_clock_loop2)
-!$omp parallel do !collapse(3) !loop2
+!c$omp parallel do !collapse(3) !loop2
     do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
 !    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        cobalt%f_chl(i,j,k) = 0.0
@@ -6947,14 +6951,14 @@ write (stdlogunit, generic_COBALT_nml)
        phyto(n)%mu_mix(i,j,1:kblt) = tmp_mu_ML / max(epsln,tmp_hblt)
     enddo;  enddo; enddo !} i,j,n
 
-!$omp parallel do !collapse(3) !loop2
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec
-!    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+!c$omp parallel do !collapse(3) !loop2
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
      do n = 1,NUM_PHYTO !{        
        phyto(n)%f_mu_mem(i,j,k) = phyto(n)%f_mu_mem(i,j,k) + (phyto(n)%mu_mix(i,j,k) - &
              phyto(n)%f_mu_mem(i,j,k))*min(1.0,cobalt%gamma_mu_mem*dt)*grid_tmask(i,j,k)
      enddo
-    enddo ; enddo; enddo !} i,j,k
+    enddo !; enddo; enddo !} i,j,k
 
     !-----------------------------------------------------------------------
     ! 1.3: Nutrient uptake calculations 
@@ -6963,9 +6967,9 @@ write (stdlogunit, generic_COBALT_nml)
     ! Uptake of nitrate and ammonia
     !
     call mpp_clock_begin(id_clock_loop3)
-!$omp parallel do !collapse(3) !loop3
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
-!    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+!c$omp parallel do !collapse(3) !loop3
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        n = DIAZO
        phyto(n)%juptake_n2(i,j,k) =  max(0.0,(1.0 - phyto(n)%no3lim(i,j,k) - phyto(n)%nh4lim(i,j,k))* &
           phyto(n)%mu(i,j,k)*phyto(n)%f_n(i,j,k))
@@ -7030,7 +7034,7 @@ write (stdlogunit, generic_COBALT_nml)
        ! Note that this is si_2_n in large phytoplankton pool, not in diatoms themselves (q_si_2_n_lg_diatoms) 
        phyto(LARGE)%q_si_2_n(i,j,k) = cobalt%f_silg(i,j,k)/(phyto(LARGE)%f_n(i,j,k)+epsln)
 
-    enddo ; enddo ; enddo !} i,j,k
+    enddo !; enddo ; enddo !} i,j,k
     call mpp_clock_end(id_clock_loop3)
     call mpp_clock_end(id_clock_phyto_growth)
 !
@@ -7046,7 +7050,7 @@ write (stdlogunit, generic_COBALT_nml)
     call mpp_clock_begin(id_clock_bacteria_growth)
     vmax_bact = (1.0/bact(1)%gge_max)*(bact(1)%mu_max + bact(1)%bresp)
     call mpp_clock_begin(id_clock_loop4)
-!$omp parallel do !collapse(3) !loop4
+!c$omp parallel do !collapse(3) !loop4
     do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec   !{
 !    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        bact(1)%temp_lim(i,j,k) = exp(bact(1)%ktemp*Temp(i,j,k))
@@ -7179,34 +7183,75 @@ write (stdlogunit, generic_COBALT_nml)
     prey_si2n_vec(7) = 0.0
 
     call mpp_clock_begin(id_clock_loop5)
-!OMP
-!$omp parallel do !collapse(3) !loop5
-     do k = 1, nk ; do j = jsc, jec ; do i = isc, iec
-!ACC
-!without ACC kernels runs twice slower than cpu, does not change fedet answers
-!With    ACC kernels runs 12 times faster than cpu , but changes fedet answers, very suspicous
+!!OMP
+!comp parallel do firstprivate(prey_vec,prey_p2n_vec,prey_fe2n_vec,prey_si2n_vec,hp_pa_vec,tot_prey_hp,pa_matrix,tot_prey,ingest_matrix) private(m,n,sw_fac_denom,sw_fac_denom,growth_ratio,assim_eff,feprime_temp,fe_salt)
 !
-!!$ACC kernels copy(cobalt,phyto,bact,zoo) copyin(temp,grid_tmask,z_remin_ramp,prey_si2n_vec,prey_fe2n_vec,prey_p2n_vec,hp_ipa_vec,ipa_matrix,tot_prey,pa_matrix,ingest_matrix,tot_prey_hp,hp_pa_vec,hp_ingest_vec)
-!!$ACC loop independent collapse(3)
+!
+!OMP target parallel loop5 runs only marginally faster than cpu. Total Energy changes as well as cobalt checksums 
+!0000 loop8(cobalt%p_fedet)    8.5817186518003946E-010   7.4962868267288075E-006  4435A678855DDFC1
+!OGPU loop8(cobalt%p_fedet)    8.5814107890003812E-010   7.4961616548039032E-006  4435A6788481A137 
+!
+!$OMP target teams distribute parallel do  map(tofrom:cobalt,phyto,bact,zoo) map(from:prey_vec) map(to:prey_p2n_vec,prey_fe2n_vec,prey_si2n_vec,hp_pa_vec,tot_prey_hp,pa_matrix,tot_prey,ingest_matrix,hp_ingest_vec,hp_ipa_vec,ipa_matrix,temp,salt) private(m,n,sw_fac_denom,sw_fac_denom,growth_ratio,assim_eff,feprime_temp,fe_salt,tot_prey_hp,assim_eff)
+!
+!ACC
+!Without ACC kernels loop5 runs twice slower than cpu!     Total Energy changes as well as cobalt checksums 
+!0000 loop8(cobalt%p_fedet)    8.5817186518003946E-010   7.4962868267288075E-006  4435A678855DDFC1
+!ACC0 loop8(cobalt%p_fedet)    8.5814107890003812E-010   7.4961616548039032E-006  4435A6788481A137
+!
+!NOTE: ACC0 answers are the same as OMPGPU !!
+!
+!With ACC kernels    loop runs 20 times slower than cpu!!! Total Energy changes as well as cobalt checksums 
+!0000 loop8(cobalt%p_fedet)    8.5817186518003946E-010   7.4962868267288075E-006
+!ACCK loop8(cobalt%p_fedet)    8.5814107889628986E-010   7.4961616547907192E-006
+!
+!cACC kernels copy(cobalt,phyto,bact,zoo) copyin(temp,salt,grid_tmask,z_remin_ramp,prey_si2n_vec,prey_fe2n_vec,prey_p2n_vec,hp_ipa_vec,ipa_matrix,tot_prey,pa_matrix,ingest_matrix,tot_prey_hp,hp_pa_vec,hp_ingest_vec) copyout(prey_vec) 
+!cACC loop independent collapse(3) private(m,n,sw_fac_denom,sw_fac_denom,growth_ratio,assim_eff,feprime_temp,fe_salt,tot_prey_hp,sw_fac_denom,assim_eff)
+!
+!c$ACC parallel loop collapse(3)
+
 !     do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; !{
 !
 !Docon
 !As fast and the same anwers are ACC kernels
-!    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+!mthd secs
+!0000 121. loop8.0(cobalt%p_fedet)    8.5817186518003946E-010   7.4962868267288075E-006  4435A678855DDFC1
+!offload first part of loop5
+!OGPU 105. loop8.0(cobalt%p_fedet)    8.5814107890003812E-010   7.4961616548039032E-006  4435A6788481A137
+!OGPU 107. loop8.0(cobalt%p_fedet)    8.5814107890003812E-010   7.4961616548039032E-006  4435A6788481A137 
+!ACC0 304. loop8.0(cobalt%p_fedet)    8.5814107890003812E-010   7.4961616548039032E-006  4435A6788481A137
+!ACC0 276. loop8.0(cobalt%p_fedet)    8.5814107890003812E-010   7.4961616548039032E-006  4435A6788481A137
+!DCON  84. loop8.0(cobalt%p_fedet)    8.5814107890003812E-010   7.4961616548039032E-006  4435A6788481A137
+!offload whole loop5
+!OGPU 154. loop8.1(cobalt%p_fedet)    8.5814107889628986E-010   7.4961616547907192E-006  4435A6788481A0D4
+!DCON  13. loop8.1(cobalt%p_fedet)    8.5814107889628986E-010   7.4961616547907192E-006  4435A6788481A0D4
+!
+!offload  loop5,loop8, loop14
+!     openmp(secs)
+!0000 256.   loop8(cobalt%p_fedet)    8.5817186518003946E-010   7.4962868267288075E-006  4435A678855DDFC1
+!DCON 141.   loop8(cobalt%p_fedet)    8.5814107889628986E-010   7.4961616547907192E-006  4435A6788481A0D4
+!offload  loop5,loop8, loop14, 1,2 3,11,12,
+!DCON  71.   loop8(cobalt%p_fedet)    8.5814107890661173E-010   7.4961616548216562E-006  4435A678848190E9
+!offload  loop5,loop8, loop14, 1,2 3,11,12,9,4
+!DCON  53.   loop8(cobalt%p_fedet)    8.5814107890661173E-010   7.4961616548216562E-006  4435A678848190E9 
+!
+!NOTE: ACC0 and DOCON  answers are the same as OMPGPU !! 
+!Only DOCONCURRENT has a significan speedup 
+!For DOCONCURRENT to work comment out $OMP and $ACC
+!
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        !
        ! 3.1.1: Calculate zooplankton ingestion fluxes
        !
 
        ! Calculate the temperature and oxygen limitations, no ingestion
        ! in low o2 environments
-       do m = 1,3  !{
-          zoo(m)%temp_lim(i,j,k) = exp(zoo(m)%ktemp*Temp(i,j,k))
-          zoo(m)%o2lim(i,j,k) = max((cobalt%f_o2(i,j,k) - cobalt%o2_min),0.0)/ & 
-                                (cobalt%k_o2 + max(cobalt%f_o2(i,j,k)-cobalt%o2_min,0.0))
-       enddo  !}  m
        cobalt%hp_temp_lim(i,j,k) = exp(cobalt%ktemp_hp*Temp(i,j,k))
        cobalt%hp_o2lim(i,j,k) = max((cobalt%f_o2(i,j,k) - cobalt%o2_min),0.0)/ &
                                 (cobalt%k_o2 + max(cobalt%f_o2(i,j,k)-cobalt%o2_min,0.0))
+       do m = 1,3  !{
+          zoo(m)%temp_lim(i,j,k) = exp(zoo(m)%ktemp*Temp(i,j,k))
+          zoo(m)%o2lim(i,j,k) = cobalt%hp_o2lim(i,j,k)
+       enddo  !}  m
 
        ! Prey vectors for ingestion and loss calculations 
        ! (note: ordering of phytoplankton must be consistent with
@@ -7408,7 +7453,10 @@ write (stdlogunit, generic_COBALT_nml)
          zoo(n)%jhploss_p(i,j,k) = zoo(n)%jhploss_n(i,j,k)*prey_p2n_vec(NUM_PHYTO+1+n)
        enddo !} n
 
+!loop8.0
+!    enddo !concurrent
 !    enddo; enddo; enddo  !} i,j,k
+
 !    call mpp_clock_end(id_clock_zooplankton_calculations)
 
     !
@@ -7658,32 +7706,32 @@ write (stdlogunit, generic_COBALT_nml)
     !
     ! 4.1: Calculate aragonite and calcite saturation states
     !
-       if (co2_calc == "ocmip2") then
-         TK = Temp(i,j,k) + 273.15
-         PRESS = 0.1016 * cobalt%zt(i,j,k) + 1.013
-         PKSPA = 171.945 + 0.077993 * TK - 2903.293 / TK - 71.595 * log10(TK) - (-0.068393 + 1.7276e-3 * &
-            TK + 88.135 / TK) * sqrt(max(epsln, Salt(i,j,k))) + 0.10018 * max(epsln, Salt(i,j,k)) -      &
-            5.9415e-3 * max(epsln, Salt(i,j,k))**(1.5) - 0.02 - (48.76 - 2.8 - 0.5304 * Temp(i,j,k)) *   &
-            (PRESS - 1.013) / (191.46 * TK) + (1e-3 * (11.76 - 0.3692 * Temp(i,j,k))) * (PRESS - 1.013) *&
-            (PRESS - 1.013) / (382.92 * TK)
-         cobalt%co3_sol_arag(i,j,k) = 10**(-PKSPA) / (2.937d-4 * max(5.0, Salt(i,j,k)))
-         cobalt%omega_arag(i,j,k) = cobalt%f_co3_ion(i,j,k) / cobalt%co3_sol_arag(i,j,k)
-         PKSPC = 171.9065 + 0.077993 * TK - 2839.319 / TK - 71.595 * log10(TK) - (-0.77712 + 2.8426e-3 * &
-            TK + 178.34 / TK) * sqrt(max(epsln, Salt(i,j,k))) + 0.07711 * max(epsln, Salt(i,j,k)) -      &
-            4.1249e-3 * max(epsln, Salt(i,j,k))**(1.5) - 0.02 - (48.76 - 0.5304 * Temp(i,j,k)) *         &
-            (PRESS - 1.013) / (191.46 * TK) + (1e-3 * (11.76 - 0.3692 * Temp(i,j,k))) * (PRESS - 1.013) *&
-            (PRESS - 1.013) / (382.92 * TK)
-         cobalt%co3_sol_calc(i,j,k) = 10**(-PKSPC) / (2.937d-4 * max(5.0, Salt(i,j,k)))
-         cobalt%omega_calc(i,j,k) = cobalt%f_co3_ion(i,j,k) / cobalt%co3_sol_calc(i,j,k)
-      else if (co2_calc == "mocsy") then
+!       if (co2_calc == "ocmip2") then
+!         TK = Temp(i,j,k) + 273.15
+!         PRESS = 0.1016 * cobalt%zt(i,j,k) + 1.013
+!         PKSPA = 171.945 + 0.077993 * TK - 2903.293 / TK - 71.595 * log10(TK) - (-0.068393 + 1.7276e-3 * &
+!            TK + 88.135 / TK) * sqrt(max(epsln, Salt(i,j,k))) + 0.10018 * max(epsln, Salt(i,j,k)) -      &
+!            5.9415e-3 * max(epsln, Salt(i,j,k))**(1.5) - 0.02 - (48.76 - 2.8 - 0.5304 * Temp(i,j,k)) *   &
+!            (PRESS - 1.013) / (191.46 * TK) + (1e-3 * (11.76 - 0.3692 * Temp(i,j,k))) * (PRESS - 1.013) *&
+!            (PRESS - 1.013) / (382.92 * TK)
+!         cobalt%co3_sol_arag(i,j,k) = 10**(-PKSPA) / (2.937d-4 * max(5.0, Salt(i,j,k)))
+!         cobalt%omega_arag(i,j,k) = cobalt%f_co3_ion(i,j,k) / cobalt%co3_sol_arag(i,j,k)
+!         PKSPC = 171.9065 + 0.077993 * TK - 2839.319 / TK - 71.595 * log10(TK) - (-0.77712 + 2.8426e-3 * &
+!            TK + 178.34 / TK) * sqrt(max(epsln, Salt(i,j,k))) + 0.07711 * max(epsln, Salt(i,j,k)) -      &
+!            4.1249e-3 * max(epsln, Salt(i,j,k))**(1.5) - 0.02 - (48.76 - 0.5304 * Temp(i,j,k)) *         &
+!            (PRESS - 1.013) / (191.46 * TK) + (1e-3 * (11.76 - 0.3692 * Temp(i,j,k))) * (PRESS - 1.013) *&
+!            (PRESS - 1.013) / (382.92 * TK)
+!         cobalt%co3_sol_calc(i,j,k) = 10**(-PKSPC) / (2.937d-4 * max(5.0, Salt(i,j,k)))
+!         cobalt%omega_calc(i,j,k) = cobalt%f_co3_ion(i,j,k) / cobalt%co3_sol_calc(i,j,k)
+!      else if (co2_calc == "mocsy") then
          cobalt%omega_arag(i,j,k) = cobalt%omegaa(i,j,k)  ! from Mocsy
          cobalt%omega_calc(i,j,k) = cobalt%omegac(i,j,k)  ! from Mocsy
          cobalt%co3_sol_arag(i,j,k) = cobalt%f_co3_ion(i,j,k) / max(cobalt%omega_arag(i,j,k),epsln)
          cobalt%co3_sol_calc(i,j,k) = cobalt%f_co3_ion(i,j,k) / max(cobalt%omega_calc(i,j,k),epsln)
-      else
+!      else
          !call mpp_error(FATAL,"Unable to compute aragonite and calcite saturation states")
-         print*,"FATAL: Unable to compute aragonite and calcite saturation states"
-      endif
+!         print*,"FATAL: Unable to compute aragonite and calcite saturation states for co2_calc=", co2_calc
+!      endif
 
 !    enddo; enddo ; enddo !} i,j,k
 
@@ -7851,9 +7899,13 @@ write (stdlogunit, generic_COBALT_nml)
        endif
        ! uncomment if running "no mass change" test
        !cobalt%jfe_ads(i,j,k) = 0.0
-    enddo; enddo; enddo  !} i,j,k
-!!$ACC end kernels
+!    enddo; enddo; enddo  !} i,j,k
+    enddo !concurrent
+!cACC end kernels
     call mpp_clock_end(id_clock_loop5)
+
+!Checksum to test precision
+    print*,'loop5(cobalt%jprod_fedet) ', sum(cobalt%jprod_fedet)
 
 !
 !-------------------------------------------------------------------------------------------------
@@ -7873,7 +7925,7 @@ write (stdlogunit, generic_COBALT_nml)
 
     call mpp_clock_begin(id_clock_loop6)
 
-!$omp parallel do !collapse(2) !loop6
+!c$omp parallel do !collapse(2) !loop6
     do j = jsc, jec; do i = isc, iec  !{
 !    do concurrent(j=jsc:jec,i=isc:iec)
        k = grid_kmt(i,j)
@@ -8102,9 +8154,9 @@ write (stdlogunit, generic_COBALT_nml)
     allocate(net_srcfe(isc:iec,jsc:jec,1:nk))
     allocate(pre_totsi(isc:iec,jsc:jec,1:nk))
     call mpp_clock_begin(id_clock_loop7)
-!$omp parallel do !collapse(3) !loop7
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
-!    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+!c$omp parallel do !collapse(3) !loop7
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
          pre_totn(i,j,k) = (cobalt%p_no3(i,j,k,tau) + cobalt%p_nh4(i,j,k,tau) + & 
                     cobalt%p_ndi(i,j,k,tau) + cobalt%p_nlg(i,j,k,tau) + &
                     cobalt%p_nsm(i,j,k,tau) + cobalt%p_nbact(i,j,k,tau) + &
@@ -8137,7 +8189,7 @@ write (stdlogunit, generic_COBALT_nml)
          net_srcfe(i,j,k) = cobalt%jfe_coast(i,j,k)*dt*grid_tmask(i,j,k)
          pre_totsi(i,j,k) = (cobalt%p_sio4(i,j,k,tau) + cobalt%p_silg(i,j,k,tau) + &
                     cobalt%p_sidet(i,j,k,tau))*grid_tmask(i,j,k)
-    enddo ; enddo ; enddo  !} i,j,k
+    enddo !; enddo ; enddo  !} i,j,k
     call mpp_clock_end(id_clock_loop7)
     do j = jsc, jec ; do i = isc, iec  !{
       net_srcfe(i,j,1) = net_srcfe(i,j,1)+cobalt%ffe_iceberg(i,j)*dt*grid_tmask(i,j,1)/rho_dzt(i,j,1)
@@ -8159,21 +8211,21 @@ write (stdlogunit, generic_COBALT_nml)
 !    call mpp_clock_begin(id_clock_source_sink_loop2)
     call mpp_clock_begin(id_clock_loop8)
 !OMP
-!$omp parallel do !collapse(3) loop8
-   do k = 1, nk ; do j = jsc, jec ; do i = isc, iec
+!c$omp parallel do !collapse(3) loop8
+!   do k = 1, nk ; do j = jsc, jec ; do i = isc, iec
 !ACC
 !This loop crashes if ACC kernels is used with
 !Crashed with: call to cuStreamSynchronize returned error 700: Illegal address during kernel execution
 !This is probably because of the pointers cobalt%p_* are not valid on the GPU device.
 !It works without kernels but is twice slower than cpu.
 !Also if kernels is used for loop5, this loop runs twice slower than cpu even without any acc!
-!!$ACC kernels copy(cobalt,phyto,bact,zoo) copyin(temp,grid_tmask,z_remin_ramp,prey_si2n_vec,prey_fe2n_vec,prey_p2n_vec,hp_ipa_vec,ipa_matrix,tot_prey,pa_matrix,ingest_matrix,tot_prey_hp,hp_pa_vec,hp_ingest_vec)
+!!$ACC kernels copy(cobalt,phyto,bact,zoo) This copyin is wrong copyin(temp,grid_tmask,z_remin_ramp,prey_si2n_vec,prey_fe2n_vec,prey_p2n_vec,hp_ipa_vec,ipa_matrix,tot_prey,pa_matrix,ingest_matrix,tot_prey_hp,hp_pa_vec,hp_ingest_vec)
 !
 !!$ACC loop independent collapse(3)
 !    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
 !
 !Docon
-!    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        !
        ! Diazotrophic Phytoplankton Nitrogen
        !
@@ -8472,10 +8524,13 @@ write (stdlogunit, generic_COBALT_nml)
 !    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        cobalt%p_lith(i,j,k,tau) = cobalt%p_lith(i,j,k,tau) - cobalt%jlithdet(i,j,k) * dt *        &
             grid_tmask(i,j,k)
-    enddo; enddo ; enddo  !} i,j,k
+    enddo !concurrent
+!    enddo; enddo ; enddo  !} i,j,k
 !!$ACC end kernels
     call mpp_clock_end(id_clock_loop8)
 !    call mpp_clock_end(id_clock_source_sink_loop6)
+!Checksum to test precision
+    print*,'loop8(cobalt%p_fedet) ', sum(cobalt%jfedet),sum(cobalt%p_fedet(:,:,:,1))
        
     if (do_14c) then                                        !<<RADIOCARBON
 
@@ -8581,9 +8636,9 @@ write (stdlogunit, generic_COBALT_nml)
 !or make this check optional and avoid it for production runs.
 !These ifs are particularly costly if the loop is offloaded to GPUs. 
 !
-!$omp parallel do !collapse(3) !loop9
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
-!    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+!c$omp parallel do !collapse(3) !loop9
+!    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
          post_totn(i,j,k) = (cobalt%p_no3(i,j,k,tau) + cobalt%p_nh4(i,j,k,tau) + &
                     cobalt%p_ndi(i,j,k,tau) + cobalt%p_nlg(i,j,k,tau) + &
                     cobalt%p_nsm(i,j,k,tau) + cobalt%p_nbact(i,j,k,tau) + &
@@ -8627,7 +8682,7 @@ write (stdlogunit, generic_COBALT_nml)
                     cobalt%p_sidet(i,j,k,tau))*grid_tmask(i,j,k)
          imbal = (post_totsi(i,j,k) - pre_totsi(i,j,k))*86400.0/dt*1.03e6
 !         if (abs(imbal).gt.1.0e-10) imbal_flag=5 !Silica
-    enddo ; enddo ; enddo  !} i,j,k
+    enddo !; enddo ; enddo  !} i,j,k
     call mpp_clock_end(id_clock_loop9)
  
     if(imbal_flag .gt. 0) then
@@ -8684,7 +8739,7 @@ write (stdlogunit, generic_COBALT_nml)
 
     ! O2 saturation
     call mpp_clock_begin(id_clock_loop10)
-!$omp parallel do !collapse(3) !loop10
+!c$omp parallel do !collapse(3) !loop10
     do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
 !    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
        sal = min(42.0,max(0.0,Salt(i,j,k)))
@@ -8716,9 +8771,9 @@ write (stdlogunit, generic_COBALT_nml)
     !---------------------------------------------------------------------
     !
     call mpp_clock_begin(id_clock_loop11)
-!$omp parallel do !collapse(3) !loop11
-    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
-!    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
+!c$omp parallel do !collapse(3) !loop11
+!    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
+    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec)
 
     cobalt%tot_layer_int_c(i,j,k) = (cobalt%p_dic(i,j,k,tau) + cobalt%doc_background + cobalt%p_cadet_arag(i,j,k,tau) +&
          cobalt%p_cadet_calc(i,j,k,tau) + cobalt%c_2_n * (cobalt%p_ndi(i,j,k,tau) + cobalt%p_nlg(i,j,k,tau) +      &
@@ -8767,7 +8822,7 @@ write (stdlogunit, generic_COBALT_nml)
    cobalt%tot_layer_int_poc(i,j,k) = (cobalt%p_ndi(i,j,k,tau) + cobalt%p_nlg(i,j,k,tau) + cobalt%p_nsm(i,j,k,tau) + &
          cobalt%p_nbact(i,j,k,tau) + cobalt%p_ndet(i,j,k,tau) + cobalt%p_nsmz(i,j,k,tau) + cobalt%p_nmdz(i,j,k,tau) + &
          cobalt%p_nlgz(i,j,k,tau))*cobalt%c_2_n*rho_dzt(i,j,k)
-    enddo ; enddo ; enddo  !} i,j,k
+    enddo !; enddo ; enddo  !} i,j,k
     call mpp_clock_end(id_clock_loop11)
 
 
@@ -8777,9 +8832,9 @@ write (stdlogunit, generic_COBALT_nml)
     !---------------------------------------------------------------------
     !
     call mpp_clock_begin(id_clock_loop12)
-!$omp parallel do !collapse(2) !loop12
-    do j = jsc, jec ; do i = isc, iec !{
-!    do concurrent(j=jsc:jec,i=isc:iec)
+!c$omp parallel do !collapse(2) !loop12
+!    do j = jsc, jec ; do i = isc, iec !{
+    do concurrent(j=jsc:jec,i=isc:iec)
        cobalt%wc_vert_int_c(i,j) = 0.0
        cobalt%wc_vert_int_dic(i,j) = 0.0
        cobalt%wc_vert_int_doc(i,j) = 0.0
@@ -8838,7 +8893,7 @@ write (stdlogunit, generic_COBALT_nml)
           cobalt%wc_vert_int_nfix(i,j) = cobalt%wc_vert_int_nfix(i,j) + phyto(DIAZO)%juptake_n2(i,j,k) *&
              rho_dzt(i,j,k) * grid_tmask(i,j,k)
       enddo
-    enddo ; enddo  !} i,j,k
+    enddo !; enddo  !} i,j,k
     call mpp_clock_end(id_clock_loop12)
     !
     !---------------------------------------------------------------------
@@ -8863,7 +8918,7 @@ write (stdlogunit, generic_COBALT_nml)
     enddo; enddo; enddo  !} i,j,k
 
     call mpp_clock_begin(id_clock_loop13)
-!$omp parallel do !collapse(2) !loop13
+!c$omp parallel do !collapse(2) !loop13
     do j = jsc, jec ; do i = isc, iec  !{
 !    do concurrent(j=jsc:jec,i=isc:iec)
        k = grid_kmt(i,j)
@@ -8936,9 +8991,9 @@ write (stdlogunit, generic_COBALT_nml)
     !---------------------------------------------------------------------
     !
     call mpp_clock_begin(id_clock_loop14)
-!$omp parallel do !collapse(2) !loop14
-    do j = jsc, jec ; do i = isc, iec !{
-!    do concurrent(j=jsc:jec,i=isc:iec)
+!c$omp parallel do !collapse(2) !loop14
+!    do j = jsc, jec ; do i = isc, iec !{
+    do concurrent(j=jsc:jec,i=isc:iec)
        rho_dzt_100(i,j) = rho_dzt(i,j,1)
        cobalt%f_alk_int_100(i,j) = cobalt%p_alk(i,j,1,tau) * rho_dzt(i,j,1)
        cobalt%f_dic_int_100(i,j) = cobalt%p_dic(i,j,1,tau) * rho_dzt(i,j,1)
@@ -9313,7 +9368,7 @@ write (stdlogunit, generic_COBALT_nml)
                 phyto(n)%f_n(i,j,k_100)*drho_dzt/phyto(n)%f_n_100(i,j)
           enddo
         endif
-    enddo; enddo  !} i, j
+    enddo !; enddo  !} i, j
     call mpp_clock_end(id_clock_loop14)
     deallocate(rho_dzt_100)
 
@@ -9337,7 +9392,7 @@ write (stdlogunit, generic_COBALT_nml)
     !
     allocate(rho_dzt_200(isc:iec,jsc:jec))
     call mpp_clock_begin(id_clock_loop15)
-!$omp parallel do !collapse(2) !loop15
+!c$omp parallel do !collapse(2) !loop15
     do j = jsc, jec ; do i = isc, iec !{
        rho_dzt_200(i,j) = rho_dzt(i,j,1)
        cobalt%jprod_mesozoo_200(i,j) = (zoo(2)%jprod_n(i,j,1) + zoo(3)%jprod_n(i,j,1))*rho_dzt(i,j,1)

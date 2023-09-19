@@ -35,8 +35,10 @@ module generic_tracer
 
   use fms_mod,           only: check_nml_error
   use field_manager_mod, only: fm_string_len
-  use mpp_mod, only : input_nml_file, mpp_error, NOTE, WARNING, FATAL, stdout, stdlog
-  use time_manager_mod, only : time_type
+  use mpp_mod,           only: input_nml_file, mpp_error, NOTE, WARNING, FATAL, stdout, stdlog
+  use mpp_mod,           only: mpp_clock_id, mpp_clock_begin, mpp_clock_end
+  use mpp_mod,           only: CLOCK_COMPONENT, CLOCK_SUBCOMPONENT, CLOCK_MODULE
+   use time_manager_mod, only : time_type
   use coupler_types_mod, only : coupler_2d_bc_type
 
   use FMS_ocmip2_co2calc_mod, only : read_mocsy_namelist
@@ -144,6 +146,7 @@ module generic_tracer
       do_generic_SF6, do_generic_TOPAZ,do_generic_ERGOM, do_generic_BLING, do_generic_miniBLING, do_generic_COBALT, &
       force_update_fluxes, do_generic_blres, as_param
 
+  integer :: id_clock_generic_tracer_vertdiff
 contains
 
 
@@ -254,6 +257,7 @@ contains
 
     character(len=fm_string_len), parameter :: sub_name = 'generic_tracer_init'
 
+    id_clock_generic_tracer_vertdiff = mpp_clock_id('(generic_tracer: vertdiff_G)',grain=CLOCK_MODULE)
     call g_tracer_set_common(isc,iec,jsc,jec,isd,ied,jsd,jed,nk,ntau,axes,grid_tmask,grid_kmt,init_time) 
 
     !Allocate and initialize all registered generic tracers
@@ -635,6 +639,7 @@ contains
     integer,                intent(in) :: tau
     type(g_tracer_type), pointer    :: g_tracer,g_tracer_next
 
+    call mpp_clock_begin(id_clock_generic_tracer_vertdiff)
     !nnz: Should I loop here or inside the sub g_tracer_vertdiff ?    
     !JGJ 2013/05/31  merged COBALT into siena_201303
     if(do_generic_abiotic .or. do_generic_age .or. do_generic_argon .or. do_generic_CFC .or. do_generic_SF6 .or. do_generic_TOPAZ &
@@ -653,6 +658,7 @@ contains
 
        enddo
     endif
+    call mpp_clock_end(id_clock_generic_tracer_vertdiff)
 
   end subroutine generic_tracer_vertdiff_G
 
