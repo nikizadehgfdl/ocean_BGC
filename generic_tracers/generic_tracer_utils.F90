@@ -266,6 +266,7 @@ module g_tracer_utils
      integer :: flux_drydep_ind = -1
 
      logical :: requires_restart = .true.
+     logical :: requires_z_init = .false.
      ! Tracer source: filename, type, var name, units, record, gridfile  
      character(len=fm_string_len) :: src_file, src_var_name, src_var_unit, src_var_gridspec
      character(len=fm_string_len) :: obc_src_file_name,obc_src_field_name
@@ -274,6 +275,7 @@ module g_tracer_utils
      logical :: obc_has = .true.
      integer :: src_var_record
      logical :: requires_src_info = .false.
+     logical :: has_src_info = .false.
      real    :: src_var_unit_conversion = 1.0 !This factor depends on the tracer. Ask  Jasmin
      real    :: src_var_valid_min = 0.0
      real    :: src_var_valid_max  
@@ -865,8 +867,8 @@ contains
     !
     type(g_tracer_type), pointer :: g_tracer => NULL()
     integer, save :: index = 0
+    character(len=256) :: errorstring
 
-    
     !===================================================================
     !Initialize the node
     !===================================================================
@@ -994,15 +996,12 @@ contains
 
     if(present(sink_rate)) g_tracer%sink_rate = sink_rate
 
+    !in case we want to require source info for specific tracers in a package
     call  g_tracer_add_param(trim(g_tracer%name)//"_requires_src_info",g_tracer%requires_src_info , .false.)
+    !in case we want to require source info for ALL tracers in a package
+    call  g_tracer_add_param('enforce_src_info', g_tracer%requires_src_info , .false.)
 
-    if(present(requires_src_info)) then
-       g_tracer%requires_src_info = requires_src_info 
-    elseif(trim(g_tracer%package_name) .eq. 'generic_cobalt' .or. &
-           trim(g_tracer%package_name) .eq. 'generic_abiotic' .or. &
-           trim(g_tracer%package_name) .eq. 'generic_bling') then !Niki: later we can make this just else
-       call  g_tracer_add_param('enforce_src_info', g_tracer%requires_src_info ,  .true.) 
-    endif
+    if(present(requires_src_info)) g_tracer%requires_src_info = requires_src_info
        
     call  g_tracer_add_param(trim(g_tracer%name)//"_src_file",         g_tracer%src_file ,        'NULL') 
     call  g_tracer_add_param(trim(g_tracer%name)//"_src_var_name",     g_tracer%src_var_name ,    'NULL') 
@@ -1017,7 +1016,13 @@ contains
     call  g_tracer_add_param(trim(g_tracer%name)//"_obc_src_field_name",g_tracer%obc_src_field_name,trim(g_tracer%name)) 
     call  g_tracer_add_param(trim(g_tracer%name)//"_obc_lfac_in" ,g_tracer%obc_lfac_in , 1.0) 
     call  g_tracer_add_param(trim(g_tracer%name)//"_obc_lfac_out",g_tracer%obc_lfac_out, 1.0) 
-    
+
+    !Check there is src_info and if it is required
+    if(g_tracer%src_file .ne. 'NULL' .and. g_tracer%src_var_name .ne. 'NULL') g_tracer%has_src_info = .true.
+    if(g_tracer%requires_src_info .and. .not. g_tracer%has_src_info) then
+        write(errorstring, '(a)') trim(g_tracer%name)//' : requires source info but is not set in the field_table'
+        call mpp_error(FATAL, trim(sub_name) //': '//  trim(errorstring)) 
+    endif
     !===================================================================
     !Reversed Linked List implementation! Make this new node to be the head of the list.
     !===================================================================    
@@ -3490,7 +3495,7 @@ contains
        endif
 
        !Check that the required source information is set 
-       if(g_tracer%requires_src_info) then 
+       if(g_tracer%has_src_info) then 
           if(g_tracer%src_file .eq. 'NULL') then
               write(errorstring, '(a)') trim(g_tracer%name)//' : src_file is not set in the field_table'
               call mpp_error(FATAL, trim(sub_name) //': '//  trim(errorstring)) 
