@@ -3257,7 +3257,7 @@ contains
     ! de Boyer-Montegut reference:  https://doi.org/10.1029/2004JC002378
     !
     if (present(photo_acc_dpth)) then
-      pha_all_same = all(photo_acc_dpth == photo_acc_dpth(isc,jsc))
+      !pha_all_same = all(photo_acc_dpth == photo_acc_dpth(isc,jsc))
       if (pha_all_same) then
         call mpp_error(WARNING, "Using uniform photoacclimation MLD in COBALTv3 which is not reccomended."//&
                                 "Check that PHA_MLD_CALC is true in the MOM paramter files or you "//&
