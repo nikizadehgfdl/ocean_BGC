@@ -6528,6 +6528,7 @@ write (stdlogunit, generic_COBALT_nml)
 
     real :: imbal
     integer :: stdoutunit, imbal_flag, outunit
+    integer :: gpudevice
 
     call mpp_clock_begin(id_clock_generic_COBALT_update_from_source)
     r_dt = 1.0 / dt
@@ -6752,6 +6753,16 @@ write (stdlogunit, generic_COBALT_nml)
     call mpp_clock_begin(id_clock_generic_COBALT_openmp)
     call mpp_clock_begin(id_clock_loop1)
 
+!Set the gpu device according to the MPI rank, explorative!!
+!This hack works with nvhpc22.5 even without -acc compiler switch!!!
+    m=mpp_pe()
+    if(MOD(m,2) .eq. 0) then
+       gpudevice=0
+    else
+       gpudevice=1
+    endif
+!$ACC set device_num(gpudevice)
+    
 !$ call omp_set_num_threads(nthreads);
 !c$omp parallel do !collapse(3) !loop1
 !    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
