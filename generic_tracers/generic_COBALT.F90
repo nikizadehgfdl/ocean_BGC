@@ -201,6 +201,7 @@ module generic_COBALT
   type(CO2_dope_vector) :: CO2_dope_vec
 
   ! identification numbers for mpp clocks
+  integer :: id_clock_generic_COBALT_update_from_source
   integer :: id_clock_carbon_calculations
   integer :: id_clock_phyto_growth
   integer :: id_clock_bacteria_growth
@@ -326,7 +327,8 @@ contains
     id_clock_source_sink_loop6 = mpp_clock_id('(Cobalt: source/sink loop 6)',grain=CLOCK_MODULE)
     id_clock_cobalt_send_diagnostics = mpp_clock_id('(Cobalt: send diagnostics)',grain=CLOCK_MODULE)
     id_clock_cobalt_calc_diagnostics = mpp_clock_id('(Cobalt: calculate diagnostics)',grain=CLOCK_MODULE)
-
+    id_clock_generic_COBALT_update_from_source = mpp_clock_id('(Cobalt: update_from_source)' ,grain=CLOCK_MODULE)
+    
   end subroutine generic_COBALT_init
 
   !>   Register diagnostic fields to be used in this module.
@@ -3181,6 +3183,8 @@ contains
     type(g_tracer_type), pointer :: g_tracer,g_tracer_next
     real :: KD_SMOOTH = 1.0E-05
 
+    call mpp_clock_begin(id_clock_generic_COBALT_update_from_source)
+
     if(do_vertfill_pre) then
       g_tracer => tracer_list
       do
@@ -3441,6 +3445,7 @@ contains
     call g_tracer_get_values(tracer_list,'irr_aclm_sfc','field',cobalt%f_irr_aclm_sfc ,isd,jsd)
 
     ! zero out cumulative COBALT-wide production diagnostics
+   !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon1
     do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
        cobalt%jprod_fed(i,j,k) = 0.0
        cobalt%jprod_fedet(i,j,k) = 0.0
@@ -3531,6 +3536,8 @@ contains
              phyto(n)%po4lim(i,j,k), max(phyto(n)%def_fe(i,j,k),phyto(n)%felim(i,j,k)))
        enddo !} n
     enddo;  enddo ;  enddo !} i,j,k
+   !enddo !docon1
+   
     !
     !-----------------------------------------------------------------------
     ! 1.2: Light Limitation/Growth Calculations
@@ -3721,12 +3728,22 @@ contains
     enddo;  enddo !} i,j
 
     deallocate(tmp_irr_band)
+    ! This needs to be moved!
+    !nh3
+    if (do_nh3_diag) then
+    cobalt%f_nh3(:,:,:) = 0.
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+       cobalt%f_nh3(i,j,k) = cobalt%f_nh4(i,j,k)/(1.+10**(calc_pka_nh3(temp(i,j,k),salt(i,j,k))+log10(min(max(cobalt%f_htotal(i,j,1),1e-10),1e-5)))) * grid_tmask(i,j,k)
+    enddo;  enddo ; enddo !} i,j,k
+    end if
+
     !
     ! Calculate the final photoacclimation irradiance using the standard relaxation
     ! scheme (I_aclm(t+1) = I_aclm(t) + (I*(24/daylength)-I_aclm(t))*gamma*dt).
     !
     ! Do the same for the limitation on light saturated photosynthesis in the mixed layer
     !
+   !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon2
     do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
          cobalt%f_irr_aclm(i,j,k) = (cobalt%f_irr_aclm(i,j,k) + (cobalt%irr_aclm_inst(i,j,k) - &
            cobalt%f_irr_aclm(i,j,k)) * min(1.0,cobalt%gamma_irr_aclm * dt)) * grid_tmask(i,j,k)
@@ -3737,17 +3754,6 @@ contains
          enddo
 
     enddo; enddo ; enddo !} i,j,k
-
-
-    ! This needs to be moved!
-    !nh3
-    if (do_nh3_diag) then
-    cobalt%f_nh3(:,:,:) = 0.
-    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
-       cobalt%f_nh3(i,j,k) = cobalt%f_nh4(i,j,k)/(1.+10**(calc_pka_nh3(temp(i,j,k),salt(i,j,k))+log10(min(max(cobalt%f_htotal(i,j,1),1e-10),1e-5)))) * grid_tmask(i,j,k)
-    enddo;  enddo ; enddo !} i,j,k
-    end if
-
 
     !
     ! Calculate the phytoplankton growth rate calculation based on Geider et al. (1997).
@@ -3762,6 +3768,7 @@ contains
     ! Moore and Chisholm: https://doi.org/10.4319/lo.1999.44.3.0628
     ! Stock et al. (submitted) (link to be added as soon as available)
     !
+    
     do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
        cobalt%f_chl(i,j,k) = 0.0
 
@@ -3829,7 +3836,7 @@ contains
        enddo !} n
 
     enddo;  enddo ; enddo !} i,j,k
-
+   !enddo !docon2
     !
     ! Calculate the time averaged growth rate (generally over 24 hours)
     ! This is used later for phytoplankton stress calculations that can
@@ -7005,6 +7012,11 @@ contains
 !==============================================================================================================
 
     call mpp_clock_end(id_clock_cobalt_send_diagnostics)
+
+    !print a few checksums for debugging
+    if(debug) print*,'cobaltsums ', sum(cobalt%p_dic(:,:,:,1)),sum(cobalt%p_fedet(:,:,:,1))
+   
+    call mpp_clock_end(id_clock_generic_COBALT_update_from_source)
 
   end subroutine generic_COBALT_update_from_source
 
