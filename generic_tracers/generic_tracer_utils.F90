@@ -40,6 +40,9 @@ module g_tracer_utils
     use diag_manager_mod, only : send_data_FMS=>send_data
 #endif
 
+#ifdef use_PYTHON
+  use python_utilsF    , only: pyF_2_1d,pyF_1_3d,pyF_1_2d
+#endif
 
   implicit none ; private
 !-----------------------------------------------------------------------
@@ -49,6 +52,9 @@ module g_tracer_utils
 
   character(len=48), parameter :: mod_name = 'g_tracer_utils'
 
+  logical :: test_python_interface = .false.
+  logical :: debug = .true.
+  
   ! <DESCRIPTION>
   ! Public types:
   !
@@ -3240,7 +3246,11 @@ contains
     real :: b_denom_1    ! The first term in the denominator of b1, in H.
     real :: H_to_kg_m2   ! 1 / kg_m2_to_H.
     integer :: i, j, k, nz
-
+    
+    real :: ea1d(1:g_tracer_com%nk), eb1d(1:g_tracer_com%nk)
+    real :: eatop(g_tracer_com%isc:g_tracer_com%iec,g_tracer_com%jsc:g_tracer_com%jec)
+    real :: ebbot(g_tracer_com%isc:g_tracer_com%iec,g_tracer_com%jsc:g_tracer_com%jec)
+    real :: eamid(g_tracer_com%isc:g_tracer_com%iec,g_tracer_com%jsc:g_tracer_com%jec)
     !
     !   Save the current state for calculation of the implicit vertical diffusion term
     !
@@ -3366,7 +3376,38 @@ contains
          enddo
       enddo
    endif
-  end subroutine g_tracer_vertdiff_G
+      
+   #ifdef use_PYTHON
+    if (test_python_interface) then
+      if(trim(g_tracer%name(1:3)) .eq. 'alk') then
+         !test 1D array
+         ea1d(:) = ea(120,90,:)
+         eb1d(:) = eb(120,90,:)
+         call pyF_2_1d('cobalt_pyfort_test.py', 'py_plot1Darrays', 'vertdiff input args,ea,eb',ea1d, eb1d) !worked
+         !test 2D array
+         do j = g_tracer_com%jsc, g_tracer_com%jec
+            do i = g_tracer_com%isc, g_tracer_com%iec  
+               nz=g_tracer_com%grid_kmt(i,j)       
+               eatop(i,j) = ea(i,j,1)*g_tracer_com%grid_tmask(i,j,1)
+               eamid(i,j) = ea(i,j,2)*g_tracer_com%grid_tmask(i,j,2)
+               ebbot(i,j) = eb(i,j,nz)*g_tracer_com%grid_tmask(i,j,nz)
+            enddo
+         enddo
+         !
+         !call pyF_1_2d('cobalt_pyfort_test.py', 'py_plot2Darrays_blocking', 'ea at surface '//trim(g_tracer%name), eatop) !worked
+         !call pyF_1_2d('cobalt_pyfort_test.py', 'py_plot2Darrays_blocking', 'ea at mid '//trim(g_tracer%name), eamid) !worked
+         !call pyF_1_2d('cobalt_pyfort_test.py', 'py_plot2Darrays_blocking', 'eb at bottom interface '//trim(g_tracer%name), ebbot) !worked
+         !verify that ea(:,:,1) and eb(:,:,nk) are zero
+         !if(debug) then
+            if (any(eatop(:,:) .ne. 0.0)) call mpp_error(FATAL, 'g_tracer_vertdiff_G: ea(:,:,1) is not zero!')
+            if (any(ebbot(:,:) .ne. 0.0)) call mpp_error(FATAL, 'g_tracer_vertdiff_G: eb(:,:,nk) is not zero!')
+         !endif
+      end if
+    endif
+   #endif 
+
+
+end subroutine g_tracer_vertdiff_G
 
   subroutine g_diag_field_add(node_ptr, diag_id, package_name, name, axes, init_time, longname, units, &
                             missing_value, Z_diag, field_ptr, Zname, Zlongname, Zunits)

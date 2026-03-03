@@ -160,6 +160,9 @@ module generic_COBALT
 
   use FMS_co2calc_mod, only : FMS_co2calc, CO2_dope_vector
 
+#ifdef use_PYTHON
+  use python_utilsF    , only: pyF_2_1d,pyF_1_3d,pyF_1_2d
+#endif
   implicit none ; private
 
   public do_generic_COBALT
@@ -180,9 +183,9 @@ module generic_COBALT
                                              !! as_param in generic_tracer_nml by generic_tracer.F90,
                                              !! but can be replaced by setting as_param_cobalt
                                              !! in generic_COBALT_nml.
-
+  logical,save :: test_python_interface = .false. !< flag to test python interface
   namelist /generic_COBALT_nml/ co2_calc, do_14c, do_nh3_atm_ocean_exchange, scheme_nitrif, debug, &
-     do_vertfill_pre,imbalance_tolerance,as_param_cobalt
+     do_vertfill_pre,imbalance_tolerance,as_param_cobalt,test_python_interface
 
   !
   ! Array allocations and flux calculations assume that phyto(1) is the
@@ -217,6 +220,7 @@ module generic_COBALT
   integer :: id_clock_source_sink_loop6
   integer :: id_clock_cobalt_send_diagnostics
   integer :: id_clock_cobalt_calc_diagnostics
+  integer :: id_clock_cobalt_imbalance_check
 
 contains
 
@@ -328,6 +332,7 @@ contains
     id_clock_cobalt_send_diagnostics = mpp_clock_id('(Cobalt: send diagnostics)',grain=CLOCK_MODULE)
     id_clock_cobalt_calc_diagnostics = mpp_clock_id('(Cobalt: calculate diagnostics)',grain=CLOCK_MODULE)
     id_clock_generic_COBALT_update_from_source = mpp_clock_id('(Cobalt: update_from_source)' ,grain=CLOCK_MODULE)
+    id_clock_cobalt_imbalance_check = mpp_clock_id('(Cobalt: imbalance check)',grain=CLOCK_MODULE)
     
   end subroutine generic_COBALT_init
 
@@ -3184,6 +3189,9 @@ contains
     type(g_tracer_type), pointer :: g_tracer,g_tracer_next
     real :: KD_SMOOTH = 1.0E-05
 
+    real :: sum1
+    real, dimension(:,:),   Allocatable :: tmp2d
+     
     call mpp_clock_begin(id_clock_generic_COBALT_update_from_source)
 
     if(do_vertfill_pre) then
@@ -3217,6 +3225,8 @@ contains
        call g_tracer_get_values(tracer_list,'nh4'   ,'field', cobalt%f_nh4  ,isd,jsd)
     end if
     allocate(phos_nh3_exchange(isd:ied,jsd:jed))
+
+    allocate(tmp2d(isc:iec,jsc:jec))
 
     !
     ! Calculate some thickness/vertical reference points for later calculations
@@ -3452,7 +3462,7 @@ contains
        gpudevice=1
     endif
     !$ACC set device_num(gpudevice)
-        
+   
     ! zero out cumulative COBALT-wide production diagnostics
     do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
        cobalt%jprod_fed(i,j,k) = 0.0
@@ -3489,8 +3499,8 @@ contains
     !-----------------------------------------------------------------------------------
     !
     ! Calculate iron cell quota
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon1.1
-    !do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon1.1
+    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
        do n = 1,NUM_PHYTO    !{
           phyto(n)%q_fe_2_n(i,j,k) = max(0.0, phyto(n)%f_fe(i,j,k)/ &
                  max(epsln,phyto(n)%f_n(i,j,k)))
@@ -3545,15 +3555,14 @@ contains
           phyto(n)%liebig_lim(i,j,k) = min(phyto(n)%no3lim(i,j,k)+phyto(n)%nh4lim(i,j,k),&
              phyto(n)%po4lim(i,j,k), max(phyto(n)%def_fe(i,j,k),phyto(n)%felim(i,j,k)))
        enddo !} n
-    !enddo;  enddo ;  enddo !} i,j,k
-    enddo !docon1.1
+    enddo;  enddo ;  enddo !} i,j,k
+    !enddo !docon1.1
    
     !
     !-----------------------------------------------------------------------
     ! 1.2: Light Limitation/Growth Calculations
     !-----------------------------------------------------------------------
     !
-
     !
     ! Calculate the mixed layer for phytoplankton photoacclimation
     ! The default criteria is de Boyer Montegut et al. (2004), where the
@@ -3753,8 +3762,8 @@ contains
     !
     ! Do the same for the limitation on light saturated photosynthesis in the mixed layer
     !
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon1.2.2 !significant speedup on GPU, 45sec to 21sec
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon1.2.2 !significant speedup on GPU, 45sec to 21sec
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
          cobalt%f_irr_aclm(i,j,k) = (cobalt%f_irr_aclm(i,j,k) + (cobalt%irr_aclm_inst(i,j,k) - &
            cobalt%f_irr_aclm(i,j,k)) * min(1.0,cobalt%gamma_irr_aclm * dt)) * grid_tmask(i,j,k)
 
@@ -3845,8 +3854,8 @@ contains
 
        enddo !} n
 
-    !enddo;  enddo ; enddo !} i,j,k
-    enddo !docon1.2.2
+    enddo;  enddo ; enddo !} i,j,k
+    !enddo !docon1.2.2
     !
     ! Calculate the time averaged growth rate (generally over 24 hours)
     ! This is used later for phytoplankton stress calculations that can
@@ -3874,8 +3883,8 @@ contains
     !-----------------------------------------------------------------------
     !
     ! Uptake of nitrate and ammonia
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon1.3.1  
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon1.3.1  
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
        n = DIAZO
        phyto(n)%juptake_n2(i,j,k) =  max(0.0,(1.0 - phyto(n)%no3lim(i,j,k) - phyto(n)%nh4lim(i,j,k))* &
           phyto(n)%mu(i,j,k)*phyto(n)%f_n(i,j,k))
@@ -3985,9 +3994,9 @@ contains
        ! Note that this is si_2_n in large phytoplankton pool, not in diatoms themselves (q_si_2_n_lg_diatoms)
        phyto(LARGE)%q_si_2_n(i,j,k) = cobalt%f_silg(i,j,k)/(phyto(LARGE)%f_n(i,j,k)+epsln)
        phyto(MEDIUM)%q_si_2_n(i,j,k) = cobalt%f_simd(i,j,k)/(phyto(MEDIUM)%f_n(i,j,k)+epsln)
-    !enddo; enddo ; enddo !} i,j,k
+    enddo; enddo ; enddo !} i,j,k
     !enddo !docon1.3.4
-    enddo !docon1.3
+    !enddo !docon1.3
     call mpp_clock_end(id_clock_phyto_growth)
 !
 !---------------------------------------------------------------------------
@@ -3999,8 +4008,8 @@ contains
     ! Anammox converts NH4+ to N2 using NO3- in low O2 environments.
     ! This was not included in ESM4.1 and gamma_nh4amx is currently 0.0
     ! by default.
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon2
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon2
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
 
        if (cobalt%f_o2(i,j,k) .lt. cobalt%o2_max_amx) then !{
          ! Uptake of NH4+ and NO3- through the anammox process
@@ -4105,8 +4114,8 @@ contains
        ! produce phosphate
        bact(1)%jprod_po4(i,j,k) = bact(1)%juptake_ldop(i,j,k) - max(bact(1)%jprod_n(i,j,k)*bact(1)%q_p_2_n,0.0)
        cobalt%jprod_po4(i,j,k) = cobalt%jprod_po4(i,j,k) + bact(1)%jprod_po4(i,j,k)
-    !enddo; enddo ; enddo !} i,j,k
-    enddo !docon2
+    enddo; enddo ; enddo !} i,j,k
+    !enddo !docon2
 !
     call mpp_clock_end(id_clock_bacteria_growth)
 !
@@ -4220,8 +4229,8 @@ contains
     ! Main loop for calculating predation by zooplankton and higher predators
     !
 
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon3.1
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon3.1
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; !{
 
        !
        ! 3.1.1: Calculate zooplankton ingestion fluxes
@@ -4491,8 +4500,8 @@ contains
          zoo(n)%jhploss_p(i,j,k) = zoo(n)%jhploss_n(i,j,k)*prey_p2n_vec(NUM_PHYTO+1+n)
        enddo !} n
 
-    !enddo; enddo; enddo  !} i,j,k
-    enddo !docon3.1
+    enddo; enddo; enddo  !} i,j,k
+    !enddo !docon3.1
     call mpp_clock_end(id_clock_zooplankton_calculations)
 
     !
@@ -4501,8 +4510,8 @@ contains
 
     call mpp_clock_begin(id_clock_other_losses)
 
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon3.2
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon3.2
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec; !{
 
        ! 3.2.1 Calculate losses of phytoplankton to aggregation and mortality and the rate of direct sinking.
        !
@@ -4604,8 +4613,8 @@ contains
           phyto(n)%jexuloss_fe(i,j,k) = phyto(n)%jexuloss_fe(i,j,k) + phyto(n)%exu*max(phyto(n)%juptake_fe(i,j,k),0.0)
        enddo
 
-    !enddo; enddo; enddo  !} i,j,k
-    enddo !docon3.2
+    enddo; enddo; enddo  !} i,j,k
+    !enddo !docon3.2
 
     ! Assume that individually sinking phytoplankton, which sink at slow rates relative to aggregates and fecal
     ! pellets, collect in a nepholoid layer and are available for resuspension if they are exposed to mixing. This
@@ -4645,8 +4654,8 @@ contains
     !
 
     call mpp_clock_begin(id_clock_production_loop)
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon3.3
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon3.3
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
 
        ! 3.3.1: Production of detritus and dissolved organic matter
        !
@@ -4852,8 +4861,8 @@ contains
          cobalt%jprod_pdet(i,j,k) = cobalt%jprod_pdet(i,j,k) + (1.0-cobalt%hp_phi_det)*cobalt%hp_jingest_p(i,j,k)
        endif
 
-    !enddo; enddo ; enddo !} i,j,k
-    enddo !docon3.3
+    enddo; enddo ; enddo !} i,j,k
+    !enddo !docon3.3
     call mpp_clock_end(id_clock_production_loop)
 
     call mpp_clock_begin(id_clock_ballast_loops)
@@ -4865,8 +4874,8 @@ contains
     ! 4.1: Determine the aragonite and calcite saturation states and the production of calcite and aragonite detritus
     !
     ! Calculate the aragonite and calcite saturation states
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon4.1
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon4.1
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
       cobalt%co3_sol_arag(i,j,k) = cobalt%f_co3_ion(i,j,k) / max(cobalt%omega_arag(i,j,k),epsln)
       cobalt%co3_sol_calc(i,j,k) = cobalt%f_co3_ion(i,j,k) / max(cobalt%omega_calc(i,j,k),epsln)
     !enddo; enddo ; enddo !} i,j,k
@@ -4893,8 +4902,8 @@ contains
                        phyto(SMALL)%jzloss_n(i,j,k)*zoo(1)%phi_det + phyto(MEDIUM)%jzloss_n(i,j,k)*zoo(2)%phi_det + &
                        phyto(SMALL)%jaggloss_n(i,j,k) + phyto(MEDIUM)%jaggloss_n(i,j,k))*cobalt%ca_2_n_calc* &
                        min(cobalt%caco3_sat_max, max(0.0, cobalt%omega_calc(i,j,k) - 1.0)) + epsln
-    !enddo; enddo ; enddo !} i,j,k
-    enddo !docon4.1
+    enddo; enddo ; enddo !} i,j,k
+    !enddo !docon4.1
 
     ! << Neritic CaCO3 burial >>
     ! << Enable neritic CaCO3 burial in shallow regions (depth <= 150m)
@@ -4945,8 +4954,8 @@ contains
     ! constant is phi_lith.  Large phytoplankton and diazotrophs are assumed to be solely consumed by filter feeding
     ! copepods.  The proportion of medium and small phytoplankton subject to filter feeding is assumed proportional to
     ! the relative prey availability of small and medium phytoplankton to copepods versus small zooplankton.
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon4.3
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon4.3
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec   !{
        cobalt%jprod_lithdet(i,j,k)=( cobalt%total_filter_feeding(i,j,k)/ &
                                    ( phyto(LARGE)%f_n(i,j,k) + phyto(DIAZO)%f_n(i,j,k) + &
                                      0.8*phyto(MEDIUM)%f_n(i,j,k) + 0.3*phyto(SMALL)%f_n(i,j,k) + epsln) * &
@@ -5156,8 +5165,8 @@ contains
        ! Add a limiter so you don't scavenge more than half the available iron in a single time step.
        cobalt%jfe_ads(i,j,k) = min(cobalt%jfe_ads(i,j,k),cobalt%f_fed(i,j,k)/(2.0*dt))
 
-    !enddo; enddo; enddo  !} i,j,k
-    enddo !docon4
+    enddo; enddo; enddo  !} i,j,k
+    !enddo !docon4
 
 !
 !-------------------------------------------------------------------------------------------------
@@ -5621,8 +5630,8 @@ contains
     !     Phytoplankton Nitrogen and Phosphorus
     !
     call mpp_clock_begin(id_clock_source_sink_loop2)
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.2
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.2
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Diazotrophic Phytoplankton Nitrogen
        !
@@ -5693,16 +5702,16 @@ contains
                             phyto(SMALL)%jaggloss_p(i,j,k) - phyto(SMALL)%jvirloss_p(i,j,k) -      &
                             phyto(SMALL)%jexuloss_p(i,j,k) - phyto(SMALL)%jmortloss_p(i,j,k)
        cobalt%p_psm(i,j,k,tau) = cobalt%p_psm(i,j,k,tau) + cobalt%jpsm(i,j,k)*dt*grid_tmask(i,j,k)
-    !enddo; enddo ; enddo  !} i,j,k
-    enddo  ! docon6.2
+    enddo; enddo ; enddo  !} i,j,k
+    !enddo  ! docon6.2
 !
     call mpp_clock_end(id_clock_source_sink_loop2)
     !
     !     Phytoplankton Silicon and Iron
     !
     call mpp_clock_begin(id_clock_source_sink_loop3)
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.3
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.3
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Large Phytoplankton Silicon
        !
@@ -5761,16 +5770,16 @@ contains
        cobalt%jnbact(i,j,k) = bact(1)%jprod_n(i,j,k) - bact(1)%jzloss_n(i,j,k) - &
                               bact(1)%jvirloss_n(i,j,k) - bact(1)%jhploss_n(i,j,k)
        cobalt%p_nbact(i,j,k,tau) = cobalt%p_nbact(i,j,k,tau) + cobalt%jnbact(i,j,k)*dt*grid_tmask(i,j,k)
-    !enddo; enddo ; enddo  !} i,j,k
-    enddo  ! docon6.3
+    enddo; enddo ; enddo  !} i,j,k
+    !enddo  ! docon6.3
 
     call mpp_clock_end(id_clock_source_sink_loop3)
     !
     !    Zooplankton
     !
     call mpp_clock_begin(id_clock_source_sink_loop4)
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.4
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.4
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Small zooplankton
        !
@@ -5789,16 +5798,16 @@ contains
        cobalt%jnlgz(i,j,k) = zoo(3)%jprod_n(i,j,k) - zoo(3)%jzloss_n(i,j,k) - &
                              zoo(3)%jhploss_n(i,j,k)
        cobalt%p_nlgz(i,j,k,tau) = cobalt%p_nlgz(i,j,k,tau) + cobalt%jnlgz(i,j,k)*dt*grid_tmask(i,j,k)
-    !enddo; enddo ; enddo  !} i,j,k
-    enddo  ! docon6.4
+    enddo; enddo ; enddo  !} i,j,k
+    !enddo  ! docon6.4
 !
     call mpp_clock_end(id_clock_source_sink_loop4)
     !
     !     NO3
     !
     call mpp_clock_begin(id_clock_source_sink_loop5)
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.5
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.5
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        cobalt%jno3(i,j,k) =  cobalt%jprod_no3nitrif(i,j,k) - phyto(DIAZO)%juptake_no3(i,j,k) - &
                              phyto(LARGE)%juptake_no3(i,j,k) - phyto(MEDIUM)%juptake_no3(i,j,k) - &
                              phyto(SMALL)%juptake_no3(i,j,k) - &
@@ -5843,8 +5852,8 @@ contains
                             phyto(LARGE)%juptake_fe(i,j,k) - phyto(MEDIUM)%juptake_fe(i,j,k) - &
                             phyto(SMALL)%juptake_fe(i,j,k) - cobalt%jfe_ads(i,j,k)
        cobalt%p_fed(i,j,k,tau) = cobalt%p_fed(i,j,k,tau) + cobalt%jfed(i,j,k) * dt * grid_tmask(i,j,k)
-    !enddo; enddo; enddo  !} i,j,k
-    enddo  ! docon6.5
+    enddo; enddo; enddo  !} i,j,k
+    !enddo  ! docon6.5
 
     call mpp_clock_end(id_clock_source_sink_loop5)
     !
@@ -5853,8 +5862,8 @@ contains
     !-----------------------------------------------------------------------
     !
     call mpp_clock_begin(id_clock_source_sink_loop6)
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.6
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !docon6.6
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        !
        ! Cadet_arag
        !
@@ -6017,8 +6026,8 @@ contains
     !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
        cobalt%p_lith(i,j,k,tau) = cobalt%p_lith(i,j,k,tau) - cobalt%jlithdet(i,j,k) * dt *        &
             grid_tmask(i,j,k)
-    !enddo; enddo ; enddo  !} i,j,k
-    enddo !docon6.6
+    enddo; enddo ; enddo  !} i,j,k
+    !enddo !docon6.6
     call mpp_clock_end(id_clock_source_sink_loop6)
 
     if (do_14c) then                                        !<<RADIOCARBON
@@ -6133,15 +6142,17 @@ contains
     !or make this check optional and avoid it for production runs.
     !These ifs are particularly costly if the loop is offloaded to GPUs (6x slower). 
     !
-    imbal_flag = 0;
+    imbal_flag = 0
     stdoutunit = stdout();
     allocate(post_totn(isc:iec,jsc:jec,1:nk))
     allocate(post_totc(isc:iec,jsc:jec,1:nk))
     allocate(post_totp(isc:iec,jsc:jec,1:nk))
     allocate(post_totsi(isc:iec,jsc:jec,1:nk))
     allocate(post_totfe(isc:iec,jsc:jec,1:nk))
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !doconCalDiag1,  need to get rid of mpp_error calls
-    !do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+    
+    call mpp_clock_begin(id_clock_cobalt_imbalance_check)
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !doconCalDiag1,  need to get rid of mpp_error calls
+    do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
       if (dzt(i,j,k).gt.cobalt%min_thickness) then
          post_totn(i,j,k) = (cobalt%p_no3(i,j,k,tau) + cobalt%p_nh4(i,j,k,tau) + &
                     cobalt%p_ndi(i,j,k,tau) + cobalt%p_nlg(i,j,k,tau) + cobalt%p_nmd(i,j,k,tau) + &
@@ -6152,7 +6163,11 @@ contains
                     cobalt%p_nsmz(i,j,k,tau) + cobalt%p_nmdz(i,j,k,tau) + &
                     cobalt%p_nlgz(i,j,k,tau))*grid_tmask(i,j,k)
          imbal = (post_totn(i,j,k) - pre_totn(i,j,k) - net_srcn(i,j,k))*86400.0/dt*1.03e6
-         !if (abs(imbal).gt.imbalance_tolerance) imbal_flag=1 !Nitrogen
+         if (abs(imbal).gt.imbalance_tolerance) then 
+            imbal_flag=1 !Nitrogen
+            print*, 'imbal_flag=',imbal_flag
+            call mpp_error(FATAL,'generic_COBALT_update_from_source: biological source/sink imbalance ')
+         endif
 
          post_totc(i,j,k) = (cobalt%p_dic(i,j,k,tau) + &
                     cobalt%p_cadet_arag(i,j,k,tau) + cobalt%p_cadet_calc(i,j,k,tau) + &
@@ -6164,7 +6179,11 @@ contains
                     cobalt%p_nsmz(i,j,k,tau) + cobalt%p_nmdz(i,j,k,tau) + &
                     cobalt%p_nlgz(i,j,k,tau)))*grid_tmask(i,j,k)
          imbal = (post_totc(i,j,k) - pre_totc(i,j,k) - net_srcc(i,j,k))*86400.0/dt*1.03e6
-         !if (abs(imbal).gt.imbalance_tolerance) imbal_flag=2 !Carbon
+         if (abs(imbal).gt.imbalance_tolerance) then 
+            imbal_flag=2 !Carbon
+            print*, 'imbal_flag=',imbal_flag
+            call mpp_error(FATAL,'generic_COBALT_update_from_source: biological source/sink imbalance ')
+         endif
 
          post_totp(i,j,k) = (cobalt%p_po4(i,j,k,tau) + cobalt%p_pdi(i,j,k,tau) + &
                     cobalt%p_plg(i,j,k,tau) + cobalt%p_pmd(i,j,k,tau) + cobalt%p_psm(i,j,k,tau) + &
@@ -6176,26 +6195,40 @@ contains
                     cobalt%p_nlgz(i,j,k,tau)*zoo(3)%q_p_2_n + &
                     bact(1)%q_p_2_n*cobalt%p_nbact(i,j,k,tau))*grid_tmask(i,j,k)
          imbal = (post_totp(i,j,k) - pre_totp(i,j,k) - net_srcp(i,j,k))*86400.0/dt*1.03e6
-         !if (abs(imbal).gt.imbalance_tolerance) imbal_flag=3 !Phosphorus
+         if (abs(imbal).gt.imbalance_tolerance) then
+            imbal_flag=3 !Phosphorus
+            print*, 'imbal_flag=',imbal_flag
+            call mpp_error(FATAL,'generic_COBALT_update_from_source: biological source/sink imbalance ')
+         endif
 
          post_totfe(i,j,k) = (cobalt%p_fed(i,j,k,tau) + cobalt%p_fedi(i,j,k,tau) + &
                     cobalt%p_felg(i,j,k,tau) + cobalt%p_femd(i,j,k,tau) + cobalt%p_fesm(i,j,k,tau) + &
                     cobalt%p_fedet(i,j,k,tau))*grid_tmask(i,j,k)
          imbal = (post_totfe(i,j,k) - pre_totfe(i,j,k) - net_srcfe(i,j,k))*86400.0/dt*1.03e6
-         !if (abs(imbal).gt.imbalance_tolerance) imbal_flag=4 !Iron
+         if (abs(imbal).gt.imbalance_tolerance) then
+            imbal_flag=4 !Iron
+            print*, 'imbal_flag=',imbal_flag
+            call mpp_error(FATAL,'generic_COBALT_update_from_source: biological source/sink imbalance ')
+         endif
 
          post_totsi(i,j,k) = (cobalt%p_sio4(i,j,k,tau) + cobalt%p_silg(i,j,k,tau) + &
                     cobalt%p_simd(i,j,k,tau) + cobalt%p_sidet(i,j,k,tau))*grid_tmask(i,j,k)
          imbal = (post_totsi(i,j,k) - pre_totsi(i,j,k))*86400.0/dt*1.03e6
-         !if (abs(imbal).gt.imbalance_tolerance) imbal_flag=5 !Silica
+         if (abs(imbal).gt.imbalance_tolerance) then 
+            imbal_flag=5 !Silica
+            print*, 'imbal_flag=',imbal_flag
+            call mpp_error(FATAL,'generic_COBALT_update_from_source: biological source/sink imbalance ')
+         endif
       endif
-    !enddo; enddo ; enddo  !} i,j,k
-    enddo !doconCalDiag1
+    enddo; enddo ; enddo  !} i,j,k
+    !enddo !doconCalDiag1
     
     if(imbal_flag .gt. 0) then
+       print*, 'imbal_flag=',imbal_flag
        call mpp_error(FATAL,'generic_COBALT_update_from_source: biological source/sink imbalance ')
-       print*, imbal_flag
     endif
+    
+    call mpp_clock_end(id_clock_cobalt_imbalance_check)
     !
     !----------------
     ! DMS diagnostics
@@ -6215,8 +6248,8 @@ contains
        cobalt%dmsos(:,:)                   = 0.
        cobalt%weight_dmsp_strat(:,:)       = 0.
 
-       do concurrent(j=jsc:jec,i=isc:iec) !doconCalcDiag2
-       !do j = jsc, jec ; do i = isc, iec  !{
+       !do concurrent(j=jsc:jec,i=isc:iec) !doconCalcDiag2
+       do j = jsc, jec ; do i = isc, iec  !{
 
           !f_chl is in ug/kg - Gali mg/m3
 
@@ -6271,8 +6304,8 @@ contains
           log10dms = cobalt%dms_alpha + (cobalt%dms_beta * log10dmsp) + (cobalt%dms_gamma * cobalt%irr_sfc_dms(i,j))
           cobalt%dmsos(i, j) = ((10.0 ** log10dms) / 1e6) * grid_tmask(i,j,1)
 
-       !enddo; enddo  !} i,j,k
-       enddo !doconCalcDiag2
+       enddo; enddo  !} i,j,k
+       !enddo !doconCalcDiag2
     end if
     !
     !-----------------------------------------------------------------------
@@ -6280,8 +6313,8 @@ contains
     !-----------------------------------------------------------------------
     !
 
-    do concurrent(j=jsc:jec,i=isc:iec) !doconCalcDiag3
-    !do j = jsc, jec ; do i = isc, iec  !{
+    !do concurrent(j=jsc:jec,i=isc:iec) !doconCalcDiag3
+    do j = jsc, jec ; do i = isc, iec  !{
       if (grid_kmt(i,j) .gt. 0) then !{
         cobalt%o2min(i,j)=cobalt%p_o2(i,j,1,tau)
         cobalt%zo2min(i,j)=cobalt%zt(i,j,1)
@@ -6305,8 +6338,8 @@ contains
            endif !}
          endif !}
       enddo;
-    !enddo ; enddo  !} i,j
-    enddo !doconCalcDiag3
+    enddo ; enddo  !} i,j
+    !enddo !doconCalcDiag3
 
     do k = 2, nk ; do j = jsc, jec ; do i = isc, iec  !{
       if (k .le. grid_kmt(i,j)) then !{
@@ -6324,8 +6357,8 @@ contains
     ! Calculate the oxygen saturation using the relationships of Garcia and Gordon, 1992. Oxygen solubility in
     ! seawater: Better fitting equations.  Limnol. Oceanogr., 37(6), pp. 1307-1312.
     ! https://aslopubs.onlinelibrary.wiley.com/doi/epdf/10.4319/lo.1992.37.6.1307
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !doconCalcDiag4
-    !do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !doconCalcDiag4
+    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
        sal = min(42.0,max(0.0,Salt(i,j,k)))
        tt = 298.15 - min(40.0,max(0.0,Temp(i,j,k)))
        tkb = 273.15 + min(40.0,max(0.0,Temp(i,j,k)))
@@ -6340,8 +6373,8 @@ contains
             exp( cobalt%a_0 + cobalt%a_1*ts + cobalt%a_2*ts2 + cobalt%a_3*ts3 + cobalt%a_4*ts4 + cobalt%a_5*ts5 + &
             (cobalt%b_0 + cobalt%b_1*ts + cobalt%b_2*ts2 + cobalt%b_3*ts3 + cobalt%c_0*sal)*sal)
 
-    !enddo; enddo ; enddo  !} i,j,k
-    enddo !doconCalcDiag4
+    enddo; enddo ; enddo  !} i,j,k
+    !enddo !doconCalcDiag4
 
     !
     ! Calculate layer integrals for key combinations of tracers, most of which are ultimately used to calculate global
@@ -6356,7 +6389,8 @@ contains
     ! The carbon layer integral (organic + inorganic).  Note that this can be calculated with or without a constant
     ! background level of recalcitrant dissolved organic carbon by setting cobalt%doc_background.  This is included
     ! at a level of 40 micromoles kg-1 by default.
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !doconCalcDiag5
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !doconCalcDiag5
+    do k = 1, nk  ; do j = jsc, jec ; do i = isc, iec
     cobalt%tot_layer_int_c(i,j,k) = (cobalt%p_dic(i,j,k,tau) + cobalt%doc_background + cobalt%p_cadet_arag(i,j,k,tau) +&
          cobalt%p_cadet_calc(i,j,k,tau) + cobalt%c_2_n * (cobalt%p_ndi(i,j,k,tau) + cobalt%p_nlg(i,j,k,tau) + &
          cobalt%p_nmd(i,j,k,tau) + cobalt%p_nsm(i,j,k,tau) + cobalt%p_nbact(i,j,k,tau) + cobalt%p_ldon(i,j,k,tau) + &
@@ -6395,7 +6429,8 @@ contains
     cobalt%tot_layer_int_o2(i,j,k) = cobalt%p_o2(i,j,k,tau)*rho_dzt(i,j,k)
 
     cobalt%tot_layer_int_alk(i,j,k) = cobalt%p_alk(i,j,k,tau)*rho_dzt(i,j,k)
-    enddo !doconCalcDiag5 
+    enddo; enddo ; enddo  !} i,j,k
+    !enddo !doconCalcDiag5 
     !
     ! calculate water column vertical integrals for tracers and fluxes (per unit area)
     ! tracer units are moles m-2, fluxes are moles sec-1 m-2
@@ -6441,8 +6476,8 @@ contains
        cobalt%wc_vert_int_jno3_iceberg(i,j) = 0.0     ! wc integrated no3 additions from icebergs
        cobalt%wc_vert_int_jpo4_iceberg(i,j) = 0.0     ! wc integrated po4 additions from icebergs
     enddo; enddo !} i,j
-    do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !doconCalcDiag6
-    !do j = jsc, jec ; do i = isc, iec ; do k = 1, nk  !{
+    !do concurrent(k=1:nk,j=jsc:jec,i=isc:iec) !doconCalcDiag6
+    do j = jsc, jec ; do i = isc, iec ; do k = 1, nk  !{
           ! Tracers ("tot_layer_int" variables already multiplied by "rho_dzt", so just sum over k to get moles m-2)
           cobalt%wc_vert_int_c(i,j) = cobalt%wc_vert_int_c(i,j) + cobalt%tot_layer_int_c(i,j,k)*grid_tmask(i,j,k)
           cobalt%wc_vert_int_dic(i,j) = cobalt%wc_vert_int_dic(i,j) + cobalt%tot_layer_int_dic(i,j,k)*grid_tmask(i,j,k)
@@ -6537,8 +6572,8 @@ contains
        cobalt%jpo4_plus_btm(i,j,k)  = cobalt%jpo4(i,j,k)
        cobalt%jsio4_plus_btm(i,j,k) = cobalt%jsio4(i,j,k)
        cobalt%jdin_plus_btm(i,j,k)  = cobalt%jno3(i,j,k) + cobalt%jnh4(i,j,k)
-    !enddo; enddo; enddo  !} i,j,k
-    enddo !doconCalcDiag6
+    enddo; enddo; enddo  !} i,j,k
+    !enddo !doconCalcDiag6
 
     ! Then find all the layers within the specified bottom boundary layer thickness.  The first layer is always included.
     ! Additional layers are included if they fall, in part or whole, within the specified bottom thickness.  This
@@ -6548,8 +6583,8 @@ contains
     allocate(rho_dzt_100(isc:iec,jsc:jec))
     allocate(rho_dzt_200(isc:iec,jsc:jec))
     
-    do concurrent(j=jsc:jec,i=isc:iec) !doconCalcDiag7
-    !do j = jsc, jec ; do i = isc, iec  !{
+    !do concurrent(j=jsc:jec,i=isc:iec) !doconCalcDiag7
+    do j = jsc, jec ; do i = isc, iec  !{
       k = grid_kmt(i,j)         ! start at the bottom
       rho_dzt_bot(i,j) = 0.0    ! local variable to track the mass of the cells assigned to the bottom (kg m-2)
       if (k .gt. 0) then !{
@@ -6973,8 +7008,8 @@ contains
                (phyto(1)%jprod_n(i,j,k_200) + phyto(2)%jprod_n(i,j,k_200) + &
                phyto(3)%jprod_n(i,j,k_200) + phyto(4)%jprod_n(i,j,k_200))*drho_dzt
        endif
-    !enddo ; enddo  !} i,j
-    enddo !doconCalcDiag8
+    enddo ; enddo  !} i,j
+    !enddo !doconCalcDiag8
     deallocate(rho_dzt_bot)
     deallocate(k_bot)
     deallocate(rho_dzt_100)
@@ -7068,6 +7103,53 @@ contains
    
     call mpp_clock_end(id_clock_generic_COBALT_update_from_source)
 
+    !test python interface
+    if (test_python_interface) then
+      !test 1D array
+      !call pyF_2_1d('test.py', 'py_plot1Darrays', 'g_tracer%field after vertdiff ',cobalt%p_dic(120,90,:,tau), cobalt%f_alk(120,90,:)) !worked
+      
+      !test a 2D array
+      do j = jsc, jec ; do i = isc, iec
+         tmp2d(i,j) = grid_tmask(i,j,1) * cobalt%f_alk(i,j,1)
+      end do ; end do
+      !tmp2d(isc+2,jsc+2) = 6.0
+      sum1=0.0
+      do j = jsc, jec ; do i = isc, iec
+         sum1 = sum1 + tmp2d(i,j)         
+      end do ; end do
+      
+      !small 2d array test
+      !deallocate(tmp2d)
+      !allocate(tmp2d(1:4,1:3)) 
+      !sum1=0.0
+      !do j = 1, 3 ; do i = 1, 4
+      !   tmp2d(i,j) = i + (j-1)*4
+      !   sum1 = sum1 + tmp2d(i,j)
+      !end do ; end do
+      
+      print *, 'sum of test array before pyF_1_2d=', sum1
+      !plot
+      !call pyF_1_2d('cobalt_pyfort_test.py', 'py_plot2Darrays', 'tmp2d', tmp2d) !if we use non-blocking plot, subsequent plots might not show up!
+      !do something with the array in pytorch
+      !call pyF_1_2d('cobalt_pyfort_test.py', 'py_torch1', 'tmp2d', tmp2d)
+      !plot
+      !call pyF_1_2d('cobalt_pyfort_test.py', 'py_plot2Darrays_blocking', 'tmp2d', tmp2d) !if we use non-blocking plot, subsequent plots might not show up!
+
+      !do something very time consuming with the array in pytorch 
+      call pyF_1_2d('cobalt_pyfort_test.py', 'py_torch2', 'tmp2d', tmp2d)
+      
+      
+      
+      sum1=0.0
+      do j = jsc, jec ; do i = isc, iec
+         sum1 = sum1 + tmp2d(i,j)         
+      end do ; end do
+      print *, 'sum of test array after pyF_1_2d=', sum1      
+
+      !test 3D array
+      !call pyF_1_3d('test.py', 'py_plot2Darrays', 'ALK', post_totn(isc:iec,jsc:jec,1:nk))
+    endif
+    
   end subroutine generic_COBALT_update_from_source
 
 
